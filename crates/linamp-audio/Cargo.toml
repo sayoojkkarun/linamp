@@ -1,0 +1,6 @@
+[package]
+name = "linamp-audio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -1,0 +1,5 @@
+/target
+*.exe
+*.wsz
+/local/
+*.swp

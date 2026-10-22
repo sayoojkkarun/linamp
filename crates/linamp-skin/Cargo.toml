@@ -1,0 +1,6 @@
+[package]
+name = "linamp-skin"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
