@@ -27,6 +27,27 @@ pub enum Status {
     Eof,
 }
 
+/// Anything the engine can play: produces interleaved stereo `f32`.
+pub trait AudioSource: Send {
+    fn info(&self) -> &StreamInfo;
+    /// Appends the next chunk of samples to `out`.
+    fn next(&mut self, out: &mut Vec<f32>) -> Result<Status, String>;
+    /// Seeks to `ms`, returns the position actually reached.
+    fn seek(&mut self, ms: u64) -> Result<u64, String>;
+}
+
+impl AudioSource for Decoder {
+    fn info(&self) -> &StreamInfo {
+        &self.info
+    }
+    fn next(&mut self, out: &mut Vec<f32>) -> Result<Status, String> {
+        Decoder::next(self, out)
+    }
+    fn seek(&mut self, ms: u64) -> Result<u64, String> {
+        Decoder::seek(self, ms)
+    }
+}
+
 pub struct Decoder {
     reader: Box<dyn FormatReader>,
     codec: Box<dyn symphonia::core::codecs::Decoder>,

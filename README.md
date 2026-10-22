@@ -16,6 +16,8 @@ is drawn procedurally, and classic `.wsz` skins load at runtime.
     decoded by [Symphonia](https://github.com/pdeljanov/Symphonia).
   - Gapless playback, stop with fadeout, stop after current, ReplayGain.
   - HTTP/Icecast/SHOUTcast streams with ICY titles.
+  - YouTube videos, playlists and channels through `yt-dlp` and `ffmpeg`
+    (see below).
 - **Equalizer:** 10 bands plus preamp, with either the Winamp or the ISO
   band set and an optional limiter. Reads and writes `.eqf` and `.q1`
   presets, and can auto-load presets per file.
@@ -51,6 +53,27 @@ packaging/install.sh
 
 Optional tools: `zenity` or `kdialog` for the file and URL dialogs, and
 `fc-match` (fontconfig) for the playlist font.
+
+## YouTube
+
+Install [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and `ffmpeg`, then open
+a YouTube link like any other URL (`Ctrl+L`, `linamp <url>`, or
+`linamp /ADD <url>`):
+
+- **A video** (`watch?v=…`, `youtu.be/…`, `/shorts/…`) plays as one track.
+- **A playlist or channel** (`playlist?list=…`, `/@name/videos`) expands into
+  its videos, up to 500.
+- **Saved playlists** keep the YouTube page URL. The audio URL expires, so it
+  is looked up again (cached for an hour) whenever the track plays.
+- **Seeking** restarts `ffmpeg` at the new position. Live streams cannot be
+  seeked.
+- **Startup** takes a couple of seconds while `yt-dlp` resolves the video.
+
+Settings in `linamp.ini`: `ytdlp_path`, `ffmpeg_path` and `ytdlp_format`
+(default `bestaudio[ext=m4a]/bestaudio`). The HTTP `proxy` setting is passed
+to both tools. Keep `yt-dlp` up to date, because YouTube changes often break
+old versions. Recent `yt-dlp` versions also want a JavaScript runtime such
+as `deno` for full format support.
 
 ## Using
 

@@ -175,6 +175,10 @@ settings! {
     replaygain_non_rg_gain: f32 = -6.0,
     // Network.
     proxy: String = String::new(),
+    // YouTube (yt-dlp + ffmpeg).
+    ytdlp_path: String = "yt-dlp".to_string(),
+    ffmpeg_path: String = "ffmpeg".to_string(),
+    ytdlp_format: String = "bestaudio[ext=m4a]/bestaudio".to_string(),
 }
 
 impl Settings {

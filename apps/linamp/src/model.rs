@@ -4,6 +4,7 @@ use crate::cli::Remote;
 use crate::dialogs::{DialogKind, DialogResult, Request};
 use crate::menu::{MenuAction, MenuItem};
 use crate::vis::Vis;
+use linamp_audio::youtube;
 use linamp_audio::{Engine, EngineCmd, EngineEvent, EqSettings, PlayState, ReplayGainSettings, StreamInfo};
 use linamp_core::atf::Format;
 use linamp_core::config::{Config, Paths, Settings};
@@ -90,6 +91,12 @@ pub struct Model {
     pub pl_dirty: u64,
 }
 
+/// Local files get their tags read; YouTube videos are resolved only when
+/// they came without a title (listings already carry one).
+fn wants_meta(e: &Entry) -> bool {
+    !e.is_url() || (youtube::is_youtube(&e.location) && e.file_title.is_none())
+}
+
 fn spawn_meta_workers(proxy: EventLoopProxy<AppEvent>) -> crossbeam_channel::Sender<(u64, String)> {
     let (tx, rx) = crossbeam_channel::unbounded::<(u64, String)>();
     for i in 0..2 {
@@ -97,7 +104,7 @@ fn spawn_meta_workers(proxy: EventLoopProxy<AppEvent>) -> crossbeam_channel::Sen
         let proxy = proxy.clone();
         let _ = std::thread::Builder::new().name(format!("linamp-meta{i}")).spawn(move || {
             for (id, path) in rx {
-                let res = linamp_audio::read_meta(Path::new(&path));
+                let res = if youtube::is_youtube(&path) { youtube::read_meta(&path) } else { linamp_audio::read_meta(Path::new(&path)) };
                 if proxy.send_event(AppEvent::Meta(id, res)).is_err() {
                     return;
                 }
@@ -111,6 +118,17 @@ fn spawn_meta_workers(proxy: EventLoopProxy<AppEvent>) -> crossbeam_channel::Sen
 fn expand(locations: Vec<String>, proxy_setting: &str) -> Vec<Item> {
     let mut out = Vec::new();
     for loc in locations {
+        if youtube::is_youtube(&loc) {
+            if youtube::is_single_video(&loc) {
+                out.push(Item { location: loc, title: None, length_ms: None });
+            } else {
+                match youtube::list(&loc) {
+                    Ok(list) => out.extend(list.into_iter().map(|i| Item { location: i.url, title: i.title, length_ms: i.length_ms })),
+                    Err(e) => log::warn!("cannot list {loc}: {e}"),
+                }
+            }
+            continue;
+        }
         if is_url(&loc) {
             if is_playlist(&loc) {
                 match linamp_audio::stream::fetch_text(&loc, proxy_setting) {
@@ -221,6 +239,12 @@ impl Model {
         self.engine.send(EngineCmd::Volume(s.volume as u8));
         self.engine.send(EngineCmd::Balance(s.balance as i8));
         self.engine.send(EngineCmd::Config { buffer_ms: s.buffer_ms, fade_ms: s.fade_ms, proxy: s.proxy.clone() });
+        youtube::configure(youtube::Config {
+            ytdlp: s.ytdlp_path.clone(),
+            ffmpeg: s.ffmpeg_path.clone(),
+            format: s.ytdlp_format.clone(),
+            proxy: s.proxy.clone(),
+        });
         self.engine.send(EngineCmd::ReplayGain(ReplayGainSettings {
             enabled: s.replaygain,
             album: s.replaygain_mode == 1,
@@ -285,7 +309,7 @@ impl Model {
             return;
         }
         for e in &entries {
-            if !e.is_url() {
+            if wants_meta(e) {
                 let _ = self.meta_tx.send((e.id, e.location.clone()));
             }
         }
@@ -341,7 +365,7 @@ impl Model {
         if let Ok(items) = plformats::read_file(&path) {
             let entries: Vec<Entry> = items.into_iter().map(Item::into_entry).collect();
             for e in &entries {
-                if !e.is_url() {
+                if wants_meta(e) {
                     let _ = self.meta_tx.send((e.id, e.location.clone()));
                 }
             }
@@ -374,6 +398,9 @@ impl Model {
         self.playlist.cursor = idx;
         self.status.stream_title = None;
         self.status.stream_name = None;
+        if youtube::is_youtube(&loc) {
+            self.flash("CONNECTING TO YOUTUBE…");
+        }
         self.engine.send(EngineCmd::Open { id, location: loc, start_ms: 0 });
         self.pl_dirty += 1;
     }
@@ -643,7 +670,7 @@ impl Model {
             DialogKind::OpenFolder { .. } => Request::Folder { title: "Open folder".into(), start },
             DialogKind::OpenUrl { .. } => Request::Entry {
                 title: "Open URL".into(),
-                text: "Enter a URL to open (e.g. http://server:8000/stream):".into(),
+                text: "Enter a URL to open (stream, playlist, or YouTube video/playlist):".into(),
                 initial: String::new(),
             },
             DialogKind::LoadPlaylist => Request::Files {
@@ -798,7 +825,7 @@ impl Model {
                         e.meta = None;
                         e.file_title = None;
                         e.refresh_display(&fmt);
-                        if !e.is_url() {
+                        if wants_meta(e) {
                             let _ = self.meta_tx.send((e.id, e.location.clone()));
                         }
                     }

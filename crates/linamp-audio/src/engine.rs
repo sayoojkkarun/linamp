@@ -5,7 +5,7 @@
 //! frames written minus the device delay, so the UI follows what is audible.
 
 use crate::alsa::AlsaPcm;
-use crate::decoder::{Decoder, Status, StreamInfo};
+use crate::decoder::{AudioSource, Decoder, Status, StreamInfo};
 use crate::dsp::{balance_gains, db_to_gain, volume_gain, EqSettings, Equalizer};
 use crate::stream::{self, StreamHeaders, TitleSlot};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
@@ -215,9 +215,12 @@ impl Drop for Engine {
     }
 }
 
+/// A source plus its tags, ICY title slot, stream headers and start offset.
+type Opened = (Box<dyn AudioSource>, TrackMeta, Option<TitleSlot>, Option<StreamHeaders>, u64);
+
 struct Track {
     id: u64,
-    dec: Decoder,
+    dec: Box<dyn AudioSource>,
     gain: f32,
     title: Option<TitleSlot>,
     last_title: Option<String>,
@@ -351,7 +354,7 @@ impl Worker {
         let pos = if self.state == PlayState::Stopped { 0 } else { self.position_ms() };
         self.shared.position_ms.store(pos, Ordering::Relaxed);
         if let Some(t) = &mut self.track {
-            let info = &t.dec.info;
+            let info = t.dec.info();
             self.shared.length_ms.store(info.length_ms.unwrap_or(u64::MAX), Ordering::Relaxed);
             self.shared.bitrate_kbps.store(info.bitrate_kbps.unwrap_or(0), Ordering::Relaxed);
             self.shared.sample_rate.store(info.sample_rate, Ordering::Relaxed);
@@ -418,17 +421,21 @@ impl Worker {
         }
     }
 
-    fn open_decoder(&self, location: &str) -> Result<(Decoder, TrackMeta, Option<TitleSlot>, Option<StreamHeaders>), String> {
-        if is_url(location) {
+    fn open_decoder(&self, location: &str, start_ms: u64) -> Result<Opened, String> {
+        if crate::youtube::is_youtube(location) {
+            // ffmpeg seeks on its own; start where asked.
+            let (src, meta) = crate::youtube::PipeSource::open(location, start_ms)?;
+            Ok((Box::new(src), meta, None, None, start_ms))
+        } else if is_url(location) {
             let (src, ext, headers, title) = stream::open(location, &self.proxy)?;
             let (dec, mut meta) = Decoder::open_source(src, ext, false)?;
             if meta.title.is_none() {
                 meta.title = headers.name.clone();
             }
-            Ok((dec, meta, Some(title), Some(headers)))
+            Ok((Box::new(dec), meta, Some(title), Some(headers), 0))
         } else {
             let (dec, meta) = Decoder::open_file(Path::new(location))?;
-            Ok((dec, meta, None, None))
+            Ok((Box::new(dec), meta, None, None, 0))
         }
     }
 
@@ -462,21 +469,21 @@ impl Worker {
         self.fade = None;
         self.resume_seek = None;
         self.next = None;
-        match self.open_decoder(location) {
-            Ok((mut dec, meta, title, headers)) => {
-                if let Err(e) = self.ensure_pcm(dec.info.sample_rate) {
+        match self.open_decoder(location, start_ms) {
+            Ok((mut dec, meta, title, headers, started_at)) => {
+                if let Err(e) = self.ensure_pcm(dec.info().sample_rate) {
                     self.fail(id, e);
                     return;
                 }
-                let mut base = 0;
-                if start_ms > 0 && dec.info.seekable {
+                let mut base = started_at;
+                if start_ms > 0 && started_at == 0 && dec.info().seekable {
                     base = dec.seek(start_ms).unwrap_or(0);
                 }
                 self.track_start = self.written;
                 self.seek_base_ms = base;
                 self.eq.reset();
                 let gain = self.track_gain(&meta);
-                let info = dec.info.clone();
+                let info = dec.info().clone();
                 self.shared.channels.store(info.channels as u32, Ordering::Relaxed);
                 self.track = Some(Track { id, dec, gain, title, last_title: None });
                 self.set_state(PlayState::Playing);
@@ -521,7 +528,7 @@ impl Worker {
 
     fn seek_to(&mut self, ms: u64) {
         let Some(t) = &mut self.track else { return };
-        if !t.dec.info.seekable {
+        if !t.dec.info().seekable {
             return;
         }
         let reached = t.dec.seek(ms).unwrap_or(ms);
@@ -529,6 +536,8 @@ impl Worker {
         self.track_start = self.written;
         self.seek_base_ms = reached;
         self.eq.reset();
+        // Publish now so a quick second relative seek starts from here.
+        self.shared.position_ms.store(reached, Ordering::Relaxed);
     }
 
     fn seek(&mut self, ms: u64) {
@@ -630,15 +639,15 @@ impl Worker {
     fn end_of_track(&mut self) {
         let finished_id = self.track.as_ref().map(|t| t.id).unwrap_or(0);
         if let Some((id, location)) = self.next.take() {
-            match self.open_decoder(&location) {
-                Ok((dec, meta, title, _)) => {
-                    let same_rate = self.pcm.as_ref().is_some_and(|p| p.rate == dec.info.sample_rate);
+            match self.open_decoder(&location, 0) {
+                Ok((dec, meta, title, _, _)) => {
+                    let same_rate = self.pcm.as_ref().is_some_and(|p| p.rate == dec.info().sample_rate);
                     if !same_rate {
-                        if let Err(e) = self.ensure_pcm(dec.info.sample_rate) {
+                        if let Err(e) = self.ensure_pcm(dec.info().sample_rate) {
                             return self.fail(id, e);
                         }
                     }
-                    let info = dec.info.clone();
+                    let info = dec.info().clone();
                     let gain = self.track_gain(&meta);
                     self.track = Some(Track { id, dec, gain, title, last_title: None });
                     self.track_start = self.written;
