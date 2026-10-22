@@ -7,23 +7,39 @@ use std::process::Command;
 #[derive(Debug, Clone)]
 pub enum DialogKind {
     /// Open files; `play` replaces the playlist, otherwise appends.
-    OpenFiles { play: bool },
-    OpenFolder { play: bool },
-    OpenUrl { play: bool },
+    OpenFiles {
+        play: bool,
+    },
+    OpenFolder {
+        play: bool,
+    },
+    OpenUrl {
+        play: bool,
+    },
     LoadPlaylist,
     SavePlaylist,
     JumpToTime,
     JumpToFile,
-    EditEntry { id: u64 },
-    EqLoadPreset { auto: bool },
-    EqSavePreset { auto: bool },
-    EqDeletePreset { auto: bool },
+    EditEntry {
+        id: u64,
+    },
+    EqLoadPreset {
+        auto: bool,
+    },
+    EqSavePreset {
+        auto: bool,
+    },
+    EqDeletePreset {
+        auto: bool,
+    },
     EqImport,
     EqExport,
     Skin,
     InstallSkin,
     Info,
-    ConfirmPhysicalRemove { paths: Vec<String> },
+    ConfirmPhysicalRemove {
+        paths: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -78,7 +94,9 @@ pub enum Request {
 
 pub fn execute(req: &Request) -> Vec<String> {
     let b = backend();
-    let lines = |s: Option<String>| -> Vec<String> { s.map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()).unwrap_or_default() };
+    let lines = |s: Option<String>| -> Vec<String> {
+        s.map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()).unwrap_or_default()
+    };
     match (b, req) {
         (Backend::None, _) => vec![],
         (Backend::Zenity, Request::Files { title, multiple, filter, start }) => {

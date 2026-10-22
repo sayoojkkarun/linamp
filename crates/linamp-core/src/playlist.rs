@@ -278,9 +278,9 @@ impl Playlist {
     pub fn sort(&mut self, key: SortKey) {
         self.reorder(|v| match key {
             SortKey::Title => v.sort_by(|a, b| natural_cmp(&a.display, &b.display)),
-            SortKey::FileName => v.sort_by(|a, b| {
-                natural_cmp(a.location.rsplit('/').next().unwrap_or(""), b.location.rsplit('/').next().unwrap_or(""))
-            }),
+            SortKey::FileName => {
+                v.sort_by(|a, b| natural_cmp(a.location.rsplit('/').next().unwrap_or(""), b.location.rsplit('/').next().unwrap_or("")))
+            }
             SortKey::Path => v.sort_by(|a, b| natural_cmp(&a.location, &b.location)),
         });
     }

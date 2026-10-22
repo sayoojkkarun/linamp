@@ -134,7 +134,6 @@ impl Bitmap {
 
     /// Saves as PNG (used by golden-image tests and `--render-skin`).
     pub fn save_png(&self, path: &std::path::Path) -> Result<(), String> {
-        image::save_buffer(path, &self.to_rgb_bytes(), self.w as u32, self.h as u32, image::ColorType::Rgb8)
-            .map_err(|e| e.to_string())
+        image::save_buffer(path, &self.to_rgb_bytes(), self.w as u32, self.h as u32, image::ColorType::Rgb8).map_err(|e| e.to_string())
     }
 }

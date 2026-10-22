@@ -208,11 +208,7 @@ fn parse_leading_int(s: &str) -> i64 {
         Some(rest) => (true, rest),
         None => (false, s),
     };
-    let n: i64 = digits
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .take(18)
-        .fold(0, |acc, c| acc * 10 + (c as i64 - '0' as i64));
+    let n: i64 = digits.chars().take_while(char::is_ascii_digit).take(18).fold(0, |acc, c| acc * 10 + (c as i64 - '0' as i64));
     if neg {
         -n
     } else {
@@ -416,11 +412,8 @@ fn call(name: &str, args: &[Vec<Node>], f: &dyn Fields) -> Val {
         }
         "abbr" => {
             let v = arg(0);
-            let s: String = v
-                .text
-                .split(|c: char| c.is_whitespace() || c == '-' || c == '(' || c == ')')
-                .filter_map(|w| w.chars().next())
-                .collect();
+            let s: String =
+                v.text.split(|c: char| c.is_whitespace() || c == '-' || c == '(' || c == ')').filter_map(|w| w.chars().next()).collect();
             Val::new(s, v.truth)
         }
         "num" => {
@@ -479,7 +472,8 @@ fn call(name: &str, args: &[Vec<Node>], f: &dyn Fields) -> Val {
         }
         "pathsafe" => {
             let v = arg(0);
-            let s: String = v.text.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '-' } else { c }).collect();
+            let s: String =
+                v.text.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '-' } else { c }).collect();
             Val::new(s, v.truth)
         }
         "strchr" | "strrchr" => {

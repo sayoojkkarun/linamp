@@ -257,6 +257,12 @@ impl Model {
     // --- playlist ------------------------------------------------------------
 
     pub fn add(&mut self, locations: Vec<String>, mode: AddMode) {
+        // Skin archives are installed, not queued.
+        let (skins, locations): (Vec<String>, Vec<String>) =
+            locations.into_iter().partition(|l| !is_url(l) && l.to_ascii_lowercase().ends_with(".wsz"));
+        if let Some(skin) = skins.last() {
+            self.install_skin(Path::new(skin));
+        }
         if locations.is_empty() {
             return;
         }
@@ -616,14 +622,16 @@ impl Model {
     // --- dialogs ---------------------------------------------------------------
 
     fn start_dir(&self) -> Option<PathBuf> {
-        self.last_dir.clone().or_else(|| std::env::var_os("HOME").map(PathBuf::from).map(|h| {
-            let music = h.join("Music");
-            if music.is_dir() {
-                music
-            } else {
-                h
-            }
-        }))
+        self.last_dir.clone().or_else(|| {
+            std::env::var_os("HOME").map(PathBuf::from).map(|h| {
+                let music = h.join("Music");
+                if music.is_dir() {
+                    music
+                } else {
+                    h
+                }
+            })
+        })
     }
 
     pub fn request_dialog(&mut self, kind: DialogKind) {
@@ -647,7 +655,11 @@ impl Model {
             DialogKind::SavePlaylist => Request::Save { title: "Save playlist".into(), name: "playlist.m3u8".into(), start },
             DialogKind::JumpToTime => {
                 let len = self.engine.shared().length_ms().map(format_duration_ms).unwrap_or_else(|| "?".into());
-                Request::Entry { title: "Jump to time".into(), text: format!("Jump to (m:ss), track length {len}:"), initial: String::new() }
+                Request::Entry {
+                    title: "Jump to time".into(),
+                    text: format!("Jump to (m:ss), track length {len}:"),
+                    initial: String::new(),
+                }
             }
             DialogKind::JumpToFile => Request::List {
                 title: "Jump to file".into(),
@@ -655,7 +667,8 @@ impl Model {
                 rows: self.playlist.entries().iter().enumerate().map(|(i, e)| format!("{}. {}", i + 1, e.display)).collect(),
             },
             DialogKind::EditEntry { id } => {
-                let loc = self.playlist.index_of_id(*id).and_then(|i| self.playlist.entry(i)).map(|e| e.location.clone()).unwrap_or_default();
+                let loc =
+                    self.playlist.index_of_id(*id).and_then(|i| self.playlist.entry(i)).map(|e| e.location.clone()).unwrap_or_default();
                 Request::Entry { title: "Edit playlist entry".into(), text: "Location:".into(), initial: loc }
             }
             DialogKind::EqLoadPreset { auto } | DialogKind::EqDeletePreset { auto } => {
@@ -676,15 +689,25 @@ impl Model {
             DialogKind::EqExport => Request::Save { title: "Save EQ preset file".into(), name: "preset.eqf".into(), start },
             DialogKind::Skin => {
                 let mut rows = vec!["<Linamp Default>".to_string()];
-                rows.extend(linamp_skin::list_skins(&self.paths.skins_dir()).iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned()));
+                rows.extend(
+                    linamp_skin::list_skins(&self.paths.skins_dir())
+                        .iter()
+                        .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned()),
+                );
                 rows.push("<Install skin from file…>".into());
                 Request::List { title: "Skin browser".into(), column: "Skin".into(), rows }
             }
-            DialogKind::InstallSkin => Request::Files { title: "Install skin".into(), multiple: false, filter: vec!["*.wsz".into(), "*.zip".into()], start },
+            DialogKind::InstallSkin => {
+                Request::Files { title: "Install skin".into(), multiple: false, filter: vec!["*.wsz".into(), "*.zip".into()], start }
+            }
             DialogKind::Info => Request::Info { title: "File info".into(), text: self.file_info_text() },
             DialogKind::ConfirmPhysicalRemove { paths } => Request::Question {
                 title: "Delete files".into(),
-                text: format!("Permanently delete {} file(s) from disk?\n\n{}", paths.len(), paths.iter().take(10).cloned().collect::<Vec<_>>().join("\n")),
+                text: format!(
+                    "Permanently delete {} file(s) from disk?\n\n{}",
+                    paths.len(),
+                    paths.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
+                ),
             },
         };
         self.ui.push(UiReq::Dialog(kind, req));
@@ -989,8 +1012,14 @@ impl Model {
                 self.pl_dirty += 1;
             }
             C::PhysicallyRemove => {
-                let paths: Vec<String> =
-                    self.playlist.selected_indices().iter().filter_map(|&i| self.playlist.entry(i)).filter(|e| !e.is_url()).map(|e| e.location.clone()).collect();
+                let paths: Vec<String> = self
+                    .playlist
+                    .selected_indices()
+                    .iter()
+                    .filter_map(|&i| self.playlist.entry(i))
+                    .filter(|e| !e.is_url())
+                    .map(|e| e.location.clone())
+                    .collect();
                 if !paths.is_empty() {
                     self.request_dialog(DialogKind::ConfirmPhysicalRemove { paths });
                 }
@@ -1208,9 +1237,7 @@ impl Model {
     pub fn options_menu(&self) -> Vec<MenuItem> {
         use Command as C;
         let s = self.settings();
-        let fmt = |label: &str, f: &str| {
-            MenuItem::action(label, "", MenuAction::TitleFormat(f.to_string())).checked(s.titlefmt == f)
-        };
+        let fmt = |label: &str, f: &str| MenuItem::action(label, "", MenuAction::TitleFormat(f.to_string())).checked(s.titlefmt == f);
         vec![
             MenuItem::cmd("Skin browser…", "Alt+S", C::SkinBrowser),
             MenuItem::sep(),
@@ -1288,7 +1315,8 @@ impl Model {
     pub fn eq_presets_menu(&self) -> Vec<MenuItem> {
         let presets = |auto: bool| -> Vec<MenuItem> {
             let list = if auto { &self.eq_auto } else { &self.eq_presets };
-            let mut v: Vec<MenuItem> = list.iter().enumerate().take(40).map(|(i, p)| MenuItem::action(&p.name, "", MenuAction::EqPreset(i, auto))).collect();
+            let mut v: Vec<MenuItem> =
+                list.iter().enumerate().take(40).map(|(i, p)| MenuItem::action(&p.name, "", MenuAction::EqPreset(i, auto))).collect();
             if v.is_empty() {
                 v.push(MenuItem::label("(none)"));
             }

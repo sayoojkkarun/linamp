@@ -148,7 +148,11 @@ impl EqWin {
             let f = t - i as f32;
             let p = |k: isize| ys[(i as isize + k).clamp(0, 9) as usize];
             let (p0, p1, p2, p3) = (p(-1), p(0), p(1), p(2));
-            let y = 0.5 * (2.0 * p1 + (-p0 + p2) * f + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * f * f + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * f * f * f);
+            let y = 0.5
+                * (2.0 * p1
+                    + (-p0 + p2) * f
+                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * f * f
+                    + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * f * f * f);
             let y = (y.round() as i32).clamp(0, 18);
             let (lo, hi) = match prev {
                 Some(py) => (py.min(y), py.max(y)),

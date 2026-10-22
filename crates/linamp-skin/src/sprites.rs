@@ -179,11 +179,14 @@ pub mod main {
     pub const AT_EJECT: (i32, i32) = (136, 89);
 
     // shufrep.bmp
-    pub const REPEAT: Toggle = Toggle { off: r(0, 0, 28, 15), off_pressed: r(0, 15, 28, 15), on: r(0, 30, 28, 15), on_pressed: r(0, 45, 28, 15) };
+    pub const REPEAT: Toggle =
+        Toggle { off: r(0, 0, 28, 15), off_pressed: r(0, 15, 28, 15), on: r(0, 30, 28, 15), on_pressed: r(0, 45, 28, 15) };
     pub const SHUFFLE: Toggle =
         Toggle { off: r(28, 0, 47, 15), off_pressed: r(28, 15, 47, 15), on: r(28, 30, 47, 15), on_pressed: r(28, 45, 47, 15) };
-    pub const EQ: Toggle = Toggle { off: r(0, 61, 23, 12), off_pressed: r(46, 61, 23, 12), on: r(0, 73, 23, 12), on_pressed: r(46, 73, 23, 12) };
-    pub const PL: Toggle = Toggle { off: r(23, 61, 23, 12), off_pressed: r(69, 61, 23, 12), on: r(23, 73, 23, 12), on_pressed: r(69, 73, 23, 12) };
+    pub const EQ: Toggle =
+        Toggle { off: r(0, 61, 23, 12), off_pressed: r(46, 61, 23, 12), on: r(0, 73, 23, 12), on_pressed: r(46, 73, 23, 12) };
+    pub const PL: Toggle =
+        Toggle { off: r(23, 61, 23, 12), off_pressed: r(69, 61, 23, 12), on: r(23, 73, 23, 12), on_pressed: r(69, 73, 23, 12) };
     pub const AT_SHUFFLE: (i32, i32) = (164, 89);
     pub const AT_REPEAT: (i32, i32) = (210, 89);
     pub const AT_EQ: (i32, i32) = (219, 58);
@@ -244,7 +247,8 @@ pub mod eq {
     pub const BG: Rect = r(0, 0, 275, 116);
     pub const TITLE_ACTIVE: Rect = r(0, 134, 275, 14);
     pub const TITLE_INACTIVE: Rect = r(0, 149, 275, 14);
-    pub const ON: Toggle = Toggle { off: r(10, 119, 26, 12), off_pressed: r(128, 119, 26, 12), on: r(69, 119, 26, 12), on_pressed: r(187, 119, 26, 12) };
+    pub const ON: Toggle =
+        Toggle { off: r(10, 119, 26, 12), off_pressed: r(128, 119, 26, 12), on: r(69, 119, 26, 12), on_pressed: r(187, 119, 26, 12) };
     pub const AUTO: Toggle =
         Toggle { off: r(36, 119, 32, 12), off_pressed: r(154, 119, 32, 12), on: r(95, 119, 32, 12), on_pressed: r(213, 119, 32, 12) };
     pub const PRESETS: Button = Button { normal: r(224, 164, 44, 12), pressed: r(224, 176, 44, 12) };
@@ -351,7 +355,9 @@ mod tests {
     #[test]
     fn every_sprite_fits_its_sheet() {
         use main as m;
-        for rect in [m::TITLE_ACTIVE, m::TITLE_INACTIVE, m::SHADE_ACTIVE, m::SHADE_INACTIVE, m::CLUTTER_BG, m::SHADE_POS_BG, m::SHADE_POS_THUMB] {
+        for rect in
+            [m::TITLE_ACTIVE, m::TITLE_INACTIVE, m::SHADE_ACTIVE, m::SHADE_INACTIVE, m::CLUTTER_BG, m::SHADE_POS_BG, m::SHADE_POS_THUMB]
+        {
             fits(Sheet::TitleBar, rect);
         }
         for b in [m::OPTIONS, m::MINIMIZE, m::SHADE, m::UNSHADE, m::CLOSE] {
@@ -408,7 +414,16 @@ mod tests {
             fits(Sheet::PlEdit, a);
             fits(Sheet::PlEdit, b);
         }
-        for rect in [pl::LEFT_TILE, pl::RIGHT_TILE, pl::BOTTOM_LEFT, pl::BOTTOM_RIGHT, pl::BOTTOM_TILE, pl::VIS, pl::CLOSE_PRESSED, pl::SHADE_PRESSED] {
+        for rect in [
+            pl::LEFT_TILE,
+            pl::RIGHT_TILE,
+            pl::BOTTOM_LEFT,
+            pl::BOTTOM_RIGHT,
+            pl::BOTTOM_TILE,
+            pl::VIS,
+            pl::CLOSE_PRESSED,
+            pl::SHADE_PRESSED,
+        ] {
             fits(Sheet::PlEdit, rect);
         }
         for m in 0..5 {

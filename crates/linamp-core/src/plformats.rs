@@ -245,7 +245,9 @@ pub fn write(items: &[Item], format: PlaylistFormat, base: Option<&Path>) -> Str
             out.push_str(&format!("NumberOfEntries={}\nVersion=2\n", items.len()));
         }
         PlaylistFormat::Xspf => {
-            out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\">\n  <trackList>\n");
+            out.push_str(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<playlist version=\"1\" xmlns=\"http://xspf.org/ns/0/\">\n  <trackList>\n",
+            );
             for it in items {
                 let loc = if is_url(&it.location) { it.location.clone() } else { path_to_file_url(&it.location) };
                 out.push_str("    <track>\n");
@@ -274,11 +276,7 @@ pub fn write_file(path: &Path, items: &[Item]) -> io::Result<()> {
 pub fn items_from_entries(entries: &[Entry]) -> Vec<Item> {
     entries
         .iter()
-        .map(|e| Item {
-            location: e.location.clone(),
-            title: Some(e.display.clone()).filter(|t| !t.is_empty()),
-            length_ms: e.length_ms,
-        })
+        .map(|e| Item { location: e.location.clone(), title: Some(e.display.clone()).filter(|t| !t.is_empty()), length_ms: e.length_ms })
         .collect()
 }
 

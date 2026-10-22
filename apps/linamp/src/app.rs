@@ -178,15 +178,15 @@ impl App {
     fn create_windows(&mut self, el: &ActiveEventLoop) {
         let scale = self.scale();
         // Keep windows on a connected monitor.
-        let monitors: Vec<(i32, i32, i32, i32)> = el
-            .available_monitors()
-            .map(|m| (m.position().x, m.position().y, m.size().width as i32, m.size().height as i32))
-            .collect();
+        let monitors: Vec<(i32, i32, i32, i32)> =
+            el.available_monitors().map(|m| (m.position().x, m.position().y, m.size().width as i32, m.size().height as i32)).collect();
         for k in KINDS {
             let (w, h) = self.logical_size(k);
             let mut pos = self.saved_pos(k);
             if self.model.settings().keeponscreen && !monitors.is_empty() {
-                let on_screen = monitors.iter().any(|&(mx, my, mw, mh)| pos.0 + 20 > mx && pos.0 < mx + mw - 20 && pos.1 >= my - 5 && pos.1 < my + mh - 14);
+                let on_screen = monitors
+                    .iter()
+                    .any(|&(mx, my, mw, mh)| pos.0 + 20 > mx && pos.0 < mx + mw - 20 && pos.1 >= my - 5 && pos.1 < my + mh - 14);
                 if !on_screen {
                     let (mx, my, _, _) = monitors[0];
                     pos = (mx + 100, my + 100 + idx(k) as i32 * 116 * scale);
@@ -452,7 +452,9 @@ impl App {
             return;
         }
         p.hover = hover;
-        let sub = hover.and_then(|h| (!p.items[h].sub.is_empty()).then(|| (p.items[h].sub.clone(), p.pos.0 + p.layout.w - 3, p.pos.1 + p.layout.rows[h].0 - 3)));
+        let sub = hover.and_then(|h| {
+            (!p.items[h].sub.is_empty()).then(|| (p.items[h].sub.clone(), p.pos.0 + p.layout.w - 3, p.pos.1 + p.layout.rows[h].0 - 3))
+        });
         self.close_popups_from(level + 1);
         self.render_popup(level);
         if let Some((items, x, y)) = sub {
@@ -629,14 +631,7 @@ impl App {
     fn input(&self, k: WinKind, right: bool, double: bool) -> Input {
         let s = self.scale();
         let c = self.win(k).map(|w| w.cursor).unwrap_or((0, 0));
-        Input {
-            x: c.0.div_euclid(s),
-            y: c.1.div_euclid(s),
-            right,
-            shift: self.mods.shift_key(),
-            ctrl: self.mods.control_key(),
-            double,
-        }
+        Input { x: c.0.div_euclid(s), y: c.1.div_euclid(s), right, shift: self.mods.shift_key(), ctrl: self.mods.control_key(), double }
     }
 
     fn handle_out(&mut self, el: &ActiveEventLoop, k: WinKind, out: Out) {
@@ -674,7 +669,9 @@ impl App {
         let right = button == MouseButton::Right;
         let pos = self.win(k).map(|w| w.cursor).unwrap_or_default();
         let double = !right
-            && self.last_click.is_some_and(|(lk, t, p)| lk == k && t.elapsed() < Duration::from_millis(400) && (p.0 - pos.0).abs() < 4 && (p.1 - pos.1).abs() < 4);
+            && self.last_click.is_some_and(|(lk, t, p)| {
+                lk == k && t.elapsed() < Duration::from_millis(400) && (p.0 - pos.0).abs() < 4 && (p.1 - pos.1).abs() < 4
+            });
         self.last_click = if right || double { None } else { Some((k, Instant::now(), pos)) };
         let input = self.input(k, right, double);
         let out = match k {
@@ -745,7 +742,8 @@ impl App {
         use KeyCode as K;
         // Window-specific keys first.
         if k == WinKind::Eq && !ctrl && !alt {
-            const UP: [K; 10] = [K::Digit1, K::Digit2, K::Digit3, K::Digit4, K::Digit5, K::Digit6, K::Digit7, K::Digit8, K::Digit9, K::Digit0];
+            const UP: [K; 10] =
+                [K::Digit1, K::Digit2, K::Digit3, K::Digit4, K::Digit5, K::Digit6, K::Digit7, K::Digit8, K::Digit9, K::Digit0];
             const DOWN: [K; 10] = [K::KeyQ, K::KeyW, K::KeyE, K::KeyR, K::KeyT, K::KeyY, K::KeyU, K::KeyI, K::KeyO, K::KeyP];
             if let Some(b) = UP.iter().position(|&c| c == code) {
                 let v = self.model.settings().eq_bands()[b] as i32 - 1;

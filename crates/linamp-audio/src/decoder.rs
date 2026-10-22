@@ -105,23 +105,14 @@ impl Decoder {
         if let Some(rev) = reader.metadata().current() {
             apply_tags(&mut meta, rev);
         }
-        let track = reader
-            .tracks()
-            .iter()
-            .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-            .ok_or("no audio track")?
-            .clone();
+        let track = reader.tracks().iter().find(|t| t.codec_params.codec != CODEC_TYPE_NULL).ok_or("no audio track")?.clone();
         let params = &track.codec_params;
-        let codec = symphonia::default::get_codecs()
-            .make(params, &DecoderOptions::default())
-            .map_err(|e| format!("unsupported codec: {e}"))?;
+        let codec =
+            symphonia::default::get_codecs().make(params, &DecoderOptions::default()).map_err(|e| format!("unsupported codec: {e}"))?;
         let sample_rate = params.sample_rate.unwrap_or(44_100);
         let channels = params.channels.map(|c| c.count() as u16).unwrap_or(2);
         let length_ms = params.n_frames.map(|n| n * 1000 / sample_rate as u64);
-        let codec_name = symphonia::default::get_codecs()
-            .get_codec(params.codec)
-            .map(|d| d.short_name.to_uppercase())
-            .unwrap_or_default();
+        let codec_name = symphonia::default::get_codecs().get_codec(params.codec).map(|d| d.short_name.to_uppercase()).unwrap_or_default();
         let bitrate_kbps = match (params.bits_per_sample, length_ms, byte_len) {
             // Lossless/PCM: average over the file is the honest figure.
             (_, Some(l), Some(b)) if l > 0 => Some((b * 8 / l) as u32),

@@ -38,7 +38,13 @@ pub struct PlColors {
 
 impl Default for PlColors {
     fn default() -> Self {
-        Self { normal: rgb(0x00, 0xff, 0x00), current: rgb(0xff, 0xff, 0xff), normal_bg: 0, selected_bg: rgb(0, 0, 0xff), font: "Arial".into() }
+        Self {
+            normal: rgb(0x00, 0xff, 0x00),
+            current: rgb(0xff, 0xff, 0xff),
+            normal_bg: 0,
+            selected_bg: rgb(0, 0, 0xff),
+            font: "Arial".into(),
+        }
     }
 }
 
@@ -214,7 +220,8 @@ mod tests {
 
     #[test]
     fn pledit() {
-        let c = parse_pledit("[Text]\nNormal=#00FF00\nCurrent=#fff\nNormalBG=#000000\nSelectedBG=0000C6\nFont=Tahoma\n", &PlColors::default());
+        let c =
+            parse_pledit("[Text]\nNormal=#00FF00\nCurrent=#fff\nNormalBG=#000000\nSelectedBG=0000C6\nFont=Tahoma\n", &PlColors::default());
         assert_eq!(c.current, 0xffffff);
         assert_eq!(c.selected_bg, 0x0000c6);
         assert_eq!(c.font, "Tahoma");

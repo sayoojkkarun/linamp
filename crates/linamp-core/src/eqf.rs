@@ -39,9 +39,7 @@ pub fn db_to_value(db: f32) -> u8 {
 }
 
 pub fn parse(data: &[u8]) -> io::Result<Vec<Preset>> {
-    let body = data
-        .strip_prefix(&HEADER[..])
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a Winamp EQ file"))?;
+    let body = data.strip_prefix(&HEADER[..]).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a Winamp EQ file"))?;
     Ok(body
         .chunks_exact(RECORD_LEN)
         .map(|rec| {
@@ -110,10 +108,7 @@ mod tests {
 
     #[test]
     fn round_trip_is_byte_exact() {
-        let presets = vec![
-            Preset { name: "Rock".into(), bands: [0, 10, 20, 31, 40, 50, 63, 1, 2, 3], preamp: 12 },
-            Preset::flat("Flat"),
-        ];
+        let presets = vec![Preset { name: "Rock".into(), bands: [0, 10, 20, 31, 40, 50, 63, 1, 2, 3], preamp: 12 }, Preset::flat("Flat")];
         let bytes = serialize(&presets);
         assert_eq!(bytes.len(), 31 + 2 * RECORD_LEN);
         assert_eq!(&bytes[..31], HEADER);

@@ -45,11 +45,7 @@ impl Font {
     }
 
     pub fn ascent(&self, px: u32) -> i32 {
-        self.font
-            .as_ref()
-            .and_then(|f| f.horizontal_line_metrics(px as f32))
-            .map(|m| m.ascent.round() as i32)
-            .unwrap_or(px as i32)
+        self.font.as_ref().and_then(|f| f.horizontal_line_metrics(px as f32)).map(|m| m.ascent.round() as i32).unwrap_or(px as i32)
     }
 
     pub fn width(&mut self, text: &str, px: u32) -> i32 {

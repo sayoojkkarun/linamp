@@ -111,11 +111,8 @@ impl AlsaPcm {
         }
         let mut retries = 0;
         while frames > 0 {
-            let ptr: *const c_void = if self.float {
-                samples[offset * ch..].as_ptr().cast()
-            } else {
-                self.scratch[offset * ch..].as_ptr().cast()
-            };
+            let ptr: *const c_void =
+                if self.float { samples[offset * ch..].as_ptr().cast() } else { self.scratch[offset * ch..].as_ptr().cast() };
             // SAFETY: ptr points at `frames * ch` valid samples of the configured format.
             let n = unsafe { (self.lib.writei)(self.pcm, ptr, frames as c_ulong) };
             if n < 0 {

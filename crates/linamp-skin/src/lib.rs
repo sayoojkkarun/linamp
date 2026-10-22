@@ -157,7 +157,8 @@ pub fn list_skins(dir: &Path) -> Vec<std::path::PathBuf> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
-            p.is_dir() || p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("wsz") || e.eq_ignore_ascii_case("zip"))
+            p.is_dir()
+                || p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("wsz") || e.eq_ignore_ascii_case("zip"))
         })
         .collect();
     v.sort_by(|a, b| linamp_core::text::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
@@ -181,9 +182,7 @@ mod tests {
     fn loads_from_files_with_fallbacks() {
         let mut files = HashMap::new();
         let mut img = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut img)
-            .write_image(&[255u8; 68 * 433 * 3], 68, 433, image::ExtendedColorType::Rgb8)
-            .unwrap();
+        image::codecs::png::PngEncoder::new(&mut img).write_image(&[255u8; 68 * 433 * 3], 68, 433, image::ExtendedColorType::Rgb8).unwrap();
         files.insert("volume.bmp".to_string(), img); // PNG data despite the name
         files.insert("main.bmp".to_string(), b"not an image".to_vec());
         files.insert("pledit.txt".to_string(), b"[Text]\nNormal=#112233\n".to_vec());
@@ -193,5 +192,4 @@ mod tests {
         assert_eq!(skin.sheet(Sheet::Main).w, 275, "bad main.bmp falls back to default");
         assert_eq!(skin.pl.normal, 0x112233);
     }
-
 }

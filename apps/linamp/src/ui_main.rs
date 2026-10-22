@@ -573,5 +573,4 @@ impl MainWin {
     pub fn wheel(&mut self, model: &mut Model, steps: i32) {
         model.set_volume(model.settings().volume + steps * 8);
     }
-
 }

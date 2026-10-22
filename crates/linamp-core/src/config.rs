@@ -230,10 +230,7 @@ impl Paths {
         let xdg = |var: &str, fallback: &str| {
             std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(fallback))
         };
-        Self {
-            config_dir: xdg("XDG_CONFIG_HOME", ".config").join("linamp"),
-            data_dir: xdg("XDG_DATA_HOME", ".local/share").join("linamp"),
-        }
+        Self { config_dir: xdg("XDG_CONFIG_HOME", ".config").join("linamp"), data_dir: xdg("XDG_DATA_HOME", ".local/share").join("linamp") }
     }
 
     pub fn ini_file(&self) -> PathBuf {

@@ -41,7 +41,11 @@ impl Default for ReplayGainSettings {
 #[derive(Debug)]
 pub enum EngineCmd {
     /// Start playing `location`. `id` identifies the playlist entry.
-    Open { id: u64, location: String, start_ms: u64 },
+    Open {
+        id: u64,
+        location: String,
+        start_ms: u64,
+    },
     /// The track to continue with gaplessly when the current one ends.
     SetNext(Option<(u64, String)>),
     Pause(bool),
@@ -52,20 +56,41 @@ pub enum EngineCmd {
     Balance(i8),
     Eq(EqSettings),
     ReplayGain(ReplayGainSettings),
-    Config { buffer_ms: u32, fade_ms: u32, proxy: String },
+    Config {
+        buffer_ms: u32,
+        fade_ms: u32,
+        proxy: String,
+    },
     Quit,
 }
 
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
-    Started { id: u64, info: StreamInfo, meta: TrackMeta, stream: Option<StreamHeaders> },
+    Started {
+        id: u64,
+        info: StreamInfo,
+        meta: TrackMeta,
+        stream: Option<StreamHeaders>,
+    },
     /// Gapless switch reached the speakers.
-    TrackChanged { id: u64, info: StreamInfo, meta: TrackMeta },
+    TrackChanged {
+        id: u64,
+        info: StreamInfo,
+        meta: TrackMeta,
+    },
     /// Playback ran out (no next track was queued).
-    Finished { id: u64 },
+    Finished {
+        id: u64,
+    },
     Stopped,
-    Error { id: u64, message: String },
-    StreamTitle { id: u64, title: String },
+    Error {
+        id: u64,
+        message: String,
+    },
+    StreamTitle {
+        id: u64,
+        title: String,
+    },
 }
 
 const VIS_LEN: usize = 1 << 15;

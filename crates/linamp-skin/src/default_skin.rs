@@ -249,7 +249,9 @@ fn gen_titlebar() -> Bitmap {
     small_button(&mut b, 9, 18, true, "shade");
     small_button(&mut b, 0, 27, false, "unshade");
     small_button(&mut b, 9, 27, true, "unshade");
-    for (rect, active) in [(main::TITLE_ACTIVE, true), (main::TITLE_INACTIVE, false), (r(27, 57, 275, 14), true), (r(27, 72, 275, 14), false)] {
+    for (rect, active) in
+        [(main::TITLE_ACTIVE, true), (main::TITLE_INACTIVE, false), (r(27, 57, 275, 14), true), (r(27, 72, 275, 14), false)]
+    {
         title_bar(&mut b, rect, "LINAMP", active, true);
     }
     for (rect, active) in [(main::SHADE_ACTIVE, true), (main::SHADE_INACTIVE, false)] {
@@ -355,7 +357,12 @@ fn gen_playpaus() -> Bitmap {
 fn gen_monoster() -> Bitmap {
     let (w, h) = Sheet::MonoSter.size();
     let mut b = Bitmap::new(w, h, LCD);
-    for (rect, label, on) in [(main::STEREO_ON, "stereo", true), (main::STEREO_OFF, "stereo", false), (main::MONO_ON, "mono", true), (main::MONO_OFF, "mono", false)] {
+    for (rect, label, on) in [
+        (main::STEREO_ON, "stereo", true),
+        (main::STEREO_OFF, "stereo", false),
+        (main::MONO_ON, "mono", true),
+        (main::MONO_OFF, "mono", false),
+    ] {
         b.fill(rect.x, rect.y, rect.w, rect.h, LCD);
         draw_text_centered(&mut b, rect, label, if on { LCD_ON } else { LCD_DIM });
     }
@@ -418,6 +425,9 @@ fn gen_main() -> Bitmap {
     panel(&mut b, 0, 0, w, h);
     // Display block: clutter bar, status, time, vis.
     lcd_box(&mut b, 9, 21, 94, 40);
+    // Time colon; digits are drawn over the background at runtime.
+    b.fill(72, 30, 2, 2, LCD_ON);
+    b.fill(72, 35, 2, 2, LCD_ON);
     lcd_box(&mut b, 109, 23, 158, 14);
     lcd_box(&mut b, 109, 41, 19, 10);
     lcd_box(&mut b, 154, 41, 14, 10);
