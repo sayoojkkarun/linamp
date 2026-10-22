@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo/linamp.svg" width="128" alt="Linamp logo"></p>
+
 # Linamp
 
 A Winamp-style skinnable audio player for Linux, written in Rust. Linamp contains no Winamp code or artwork. Its default skin

@@ -1190,6 +1190,7 @@ dependencies = [
  "env_logger",
  "fastrand",
  "fontdue",
+ "image",
  "linamp-audio",
  "linamp-core",
  "linamp-skin",

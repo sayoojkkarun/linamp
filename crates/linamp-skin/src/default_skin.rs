@@ -439,9 +439,20 @@ fn gen_main() -> Bitmap {
     b.hline(8, 69, 259, PANEL_HI);
     b.hline(8, 85, 259, PANEL_LO);
     b.hline(8, 86, 259, PANEL_HI);
-    b.fill(250, 91, 14, 13, PANEL_LO);
-    draw_text(&mut b, 253, 95, "l", ACCENT);
-    b.fill(258, 99, 3, 1, ACCENT);
+    // Brand mark: the logo's "L" of analyzer bars, in pixels.
+    b.fill(250, 91, 14, 13, LCD);
+    b.bevel(249, 90, 16, 15, PANEL_LO, PANEL_HI);
+    for y in 0..9 {
+        let c = mix(ACCENT, LCD_ON, y as f32 / 8.0);
+        b.fill(252, 93 + y, 2, 1, c);
+    }
+    for (x, h) in [(255, 3), (258, 4), (261, 2)] {
+        for y in 0..h {
+            b.set(x, 101 - y, mix(ACCENT, LCD_ON, (h - 1 - y) as f32 / 3.0 + 0.5));
+            b.set(x + 1, 101 - y, mix(ACCENT, LCD_ON, (h - 1 - y) as f32 / 3.0 + 0.5));
+        }
+        b.fill(x, 100 - h, 2, 1, ICON);
+    }
     b
 }
 

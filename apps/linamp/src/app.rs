@@ -204,7 +204,8 @@ impl App {
                 .with_inner_size(PhysicalSize::new((w * scale) as u32, (h * scale) as u32))
                 .with_position(PhysicalPosition::new(pos.0, pos.1))
                 .with_visible(false)
-                .with_name("linamp", "Linamp");
+                .with_name("linamp", "Linamp")
+                .with_window_icon(window_icon());
             if k != WinKind::Main {
                 attrs = attrs.with_x11_window_type(vec![XWindowType::Utility]);
             }
@@ -1031,6 +1032,14 @@ impl App {
             self.render(WinKind::Pl);
         }
     }
+}
+
+/// The application logo as the window icon (taskbar, alt-tab).
+fn window_icon() -> Option<winit::window::Icon> {
+    static PNG: &[u8] = include_bytes!("../../../assets/logo/png/linamp-64.png");
+    let img = image::load_from_memory(PNG).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
 fn x11_window_id(w: &Window) -> Option<u32> {

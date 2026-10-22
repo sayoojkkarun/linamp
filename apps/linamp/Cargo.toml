@@ -13,6 +13,7 @@ linamp-skin.workspace = true
 winit.workspace = true
 softbuffer.workspace = true
 fontdue.workspace = true
+image.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
 rustfft.workspace = true
