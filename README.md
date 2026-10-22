@@ -2,8 +2,12 @@
 
 # Linamp
 
-A Winamp-style skinnable audio player for Linux, written in Rust. Linamp contains no Winamp code or artwork. Its default skin
-is drawn procedurally, and classic `.wsz` skins load at runtime.
+[![CI](https://github.com/sayoojkkarun/linamp/actions/workflows/ci.yml/badge.svg)](https://github.com/sayoojkkarun/linamp/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
+A Winamp-style skinnable audio player for Linux, written in Rust. Linamp
+contains no Winamp code or artwork. Its default skin is drawn procedurally,
+and classic `.wsz` skins load at runtime.
 
 - [Features](#features)
 - [Requirements](#requirements)
@@ -14,6 +18,8 @@ is drawn procedurally, and classic `.wsz` skins load at runtime.
 - [Test procedure](#test-procedure)
 - [Known limitations](#known-limitations)
 - [Development](#development)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Features
 
@@ -51,7 +57,7 @@ is drawn procedurally, and classic `.wsz` skins load at runtime.
 
 | Need | Version | Why |
 |---|---|---|
-| Rust toolchain (`rustc`, `cargo`) | 1.82 or newer | compiler (install with [rustup](https://rustup.rs)) |
+| Rust toolchain (`rustc`, `cargo`) | 1.89 or newer | compiler (install with [rustup](https://rustup.rs)) |
 | C compiler (`gcc` or `clang`) | any | the `ring` crate (TLS for HTTPS streams) compiles C code |
 | Internet access | — | `cargo` downloads crates on the first build |
 
@@ -116,7 +122,7 @@ source "$HOME/.cargo/env"
 ### 2. Build and run from the source tree
 
 ```sh
-git clone <this repository> linamp && cd linamp
+git clone https://github.com/sayoojkkarun/linamp.git && cd linamp
 cargo build --release
 ./target/release/linamp ~/Music
 ```
@@ -209,7 +215,7 @@ as `deno` for full format support.
 | Kernel | 7.0.12-201.fc44 |
 | Session | KDE Plasma on Wayland, Linamp running through Xwayland 24.1.12 |
 | Audio | PipeWire 1.6.7 via alsa-lib 1.2.16.1 (`default` device) |
-| Rust | rustc / cargo 1.96.0 |
+| Rust | rustc / cargo 1.96.0 (minimum supported version 1.89 checked with `cargo +1.89 check --locked`) |
 | Dialogs | zenity 4.2.2 |
 | YouTube tools | yt-dlp 2026.10.21, ffmpeg-free 8.1.2 |
 
@@ -279,7 +285,7 @@ Please report problems with these first.
   that `yt-dlp` needs.
 - No preferences window; options are in the menus and `linamp.ini`.
 - No tag editing, album art, tray icon, media library or Modern (`.wal`)
-  skins yet.
+  skins yet. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Development
 
@@ -297,3 +303,28 @@ LINAMP_SNAPSHOT=out/ linamp /NEW /INIDIR=/tmp/cfg              # render windows 
 | `crates/linamp-audio` | decoding, EQ, limiter, ALSA output, engine thread, streams, YouTube |
 | `crates/linamp-skin` | skin loading, sprite geometry, default skin generator |
 | `apps/linamp` | windows, menus, input, dialogs, IPC, MPRIS |
+
+## Contributing
+
+Bug reports and pull requests are welcome; see
+[CONTRIBUTING.md](CONTRIBUTING.md). The "Not yet tested by hand" list above
+is a good place to start. Changes are recorded in
+[CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
+
+Third-party crates keep their own licenses. Notably, the Symphonia decoders
+are MPL-2.0. Winamp is a trademark of its owner; Linamp is an independent
+project and is not affiliated with or endorsed by it.

@@ -1,0 +1,67 @@
+# Contributing to Linamp
+
+Thanks for helping! Bug reports, testing on other distributions and pull
+requests are all welcome.
+
+## Reporting bugs
+
+Please include:
+
+- distribution, desktop and session type (`echo $XDG_SESSION_TYPE`)
+- `linamp /VERSION` and how you installed it
+- steps to reproduce, and what you expected instead
+- a log from `RUST_LOG=debug linamp /NEW …` if playback or skins misbehave
+- for skin problems, the `.wsz` file (if you are allowed to share it)
+
+## Development setup
+
+Requirements are in the [README](README.md#requirements): Rust 1.89 or
+newer and a C compiler. No `-devel` packages are needed.
+
+```sh
+cargo build
+cargo run -p linamp -- /NEW /INIDIR=/tmp/linamp-dev ~/Music
+```
+
+Use `/NEW /INIDIR=<dir>` while developing so you don't touch your real
+settings or a running instance.
+
+Useful tools:
+
+```sh
+cargo run -p linamp-audio --example play -- --vol 0 file.flac   # engine without UI
+cargo run -p linamp-skin --example dump_sheets -- skin.wsz out/  # skin sheets as PNG
+LINAMP_SNAPSHOT=out/ cargo run -p linamp -- /NEW /INIDIR=/tmp/x  # windows as PNG, then exit
+```
+
+## Before opening a pull request
+
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+CI runs the same checks, plus a build with the minimum supported Rust
+version (1.89).
+
+Guidelines:
+
+- **Scope:** keep changes focused; one logical change per commit, with a
+  message that says why.
+- **Tests:** add unit tests for parsing, formats and model logic. UI changes
+  should come with a before/after `LINAMP_SNAPSHOT` image in the PR.
+- **Real-time safety:** don't block the audio thread on locks the UI holds
+  for long, and don't do I/O on the UI thread. Use the existing worker
+  threads and events.
+- **Artwork:** do not add artwork, presets or code from Winamp or other
+  proprietary software. The default skin is drawn in code
+  (`crates/linamp-skin/src/default_skin.rs`), and third-party skins are
+  loaded at runtime, never bundled.
+- **Dependencies:** must be compatible with MIT OR Apache-2.0 distribution.
+  Prefer crates that don't need system `-devel` packages at build time.
+
+## License
+
+By contributing you agree that your contributions are dual licensed under
+MIT OR Apache-2.0, as described in the [README](README.md#license).
