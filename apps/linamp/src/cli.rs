@@ -16,6 +16,7 @@ pub enum Remote {
     PanStep(i32),
     Shuffle(Option<bool>),
     Repeat(Option<bool>),
+    SeekMs(u64),
     Clear,
     Show,
     Quit,

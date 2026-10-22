@@ -88,10 +88,11 @@ pub struct App {
     /// `LINAMP_SNAPSHOT=<dir>`: write each window as PNG after a few frames and exit.
     snapshot: Option<(std::path::PathBuf, u32)>,
     x11: Option<x11rb::rust_connection::RustConnection>,
+    mpris: Option<crate::mpris::Mpris>,
 }
 
 impl App {
-    pub fn new(model: Model, start_minimized: bool) -> App {
+    pub fn new(model: Model, start_minimized: bool, mpris: Option<crate::mpris::Mpris>) -> App {
         let font = Font::load(&model.skin.pl.font);
         let x11 = x11rb::connect(None).map(|(c, _)| c).map_err(|e| log::warn!("no X11 connection for window shapes: {e}")).ok();
         App {
@@ -115,6 +116,7 @@ impl App {
             popup_focus_check: None,
             snapshot: std::env::var_os("LINAMP_SNAPSHOT").map(|d| (std::path::PathBuf::from(d), 0)),
             x11,
+            mpris,
         }
     }
 
@@ -971,6 +973,9 @@ impl App {
                     self.render(WinKind::Main);
                 }
             }
+        }
+        if let Some(m) = &mut self.mpris {
+            m.update(self.model.mpris_snapshot());
         }
         if self.model.pl_dirty != self.seen_pl_dirty {
             self.seen_pl_dirty = self.model.pl_dirty;

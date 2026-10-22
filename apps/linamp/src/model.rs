@@ -1373,6 +1373,7 @@ impl Model {
                     self.settings_mut().repeat = v;
                     self.update_next();
                 }
+                Remote::SeekMs(ms) => self.seek_to(ms),
                 Remote::Clear => self.exec(Command::ClearPlaylist),
                 Remote::Show => self.ui.push(UiReq::Raise),
                 Remote::Quit => self.exec(Command::Exit),
@@ -1380,6 +1381,32 @@ impl Model {
             }
         }
         reply
+    }
+
+    pub fn mpris_snapshot(&self) -> crate::mpris::Snapshot {
+        let s = self.settings();
+        let status = match self.state() {
+            PlayState::Playing => "Playing",
+            PlayState::Paused => "Paused",
+            PlayState::Stopped => "Stopped",
+        };
+        let track = self.playlist.current_entry().map(|e| {
+            let playing = self.status.playing_id == Some(e.id);
+            let meta = e.meta.as_deref();
+            let title = match (&self.status.stream_title, playing) {
+                (Some(t), true) => t.clone(),
+                _ => meta.and_then(|m| m.title.clone()).unwrap_or_else(|| e.display.clone()),
+            };
+            crate::mpris::Track {
+                id: e.id,
+                title,
+                artist: meta.and_then(|m| m.artist.clone()),
+                album: meta.and_then(|m| m.album.clone()),
+                url: e.location.clone(),
+                length_ms: e.length_ms,
+            }
+        });
+        crate::mpris::Snapshot { status, repeat: s.repeat, shuffle: s.shuffle, volume: s.volume as f64 / 255.0, track }
     }
 
     pub fn status_json(&self) -> String {

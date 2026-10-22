@@ -536,6 +536,7 @@ impl Worker {
         self.set_state(PlayState::Stopped);
         self.shared.position_ms.store(0, Ordering::Relaxed);
         self.shared.bitrate_kbps.store(0, Ordering::Relaxed);
+        self.shared.length_ms.store(u64::MAX, Ordering::Relaxed);
         if notify {
             (self.emit)(EngineEvent::Stopped);
         }
@@ -639,6 +640,7 @@ impl Worker {
         self.track = None;
         self.set_state(PlayState::Stopped);
         self.shared.position_ms.store(0, Ordering::Relaxed);
+        self.shared.length_ms.store(u64::MAX, Ordering::Relaxed);
         (self.emit)(EngineEvent::Finished { id: finished_id });
     }
 }

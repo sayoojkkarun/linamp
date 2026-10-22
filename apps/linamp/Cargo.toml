@@ -20,3 +20,4 @@ fastrand.workspace = true
 log.workspace = true
 env_logger.workspace = true
 x11rb = { version = "0.13", features = ["shape"] }
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }

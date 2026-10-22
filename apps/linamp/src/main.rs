@@ -7,6 +7,7 @@ mod font;
 mod ipc;
 mod menu;
 mod model;
+mod mpris;
 mod render;
 mod shape;
 mod ui;
@@ -100,7 +101,8 @@ fn main() {
         println!("{reply}");
     }
 
-    let mut app = app::App::new(model, opts.start_minimized);
+    let mpris = mpris::spawn(proxy.clone(), model.engine.shared().clone(), &class);
+    let mut app = app::App::new(model, opts.start_minimized, mpris);
     if let Err(e) = event_loop.run_app(&mut app) {
         log::error!("event loop: {e}");
     }
