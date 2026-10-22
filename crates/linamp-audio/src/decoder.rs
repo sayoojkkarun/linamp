@@ -132,7 +132,14 @@ impl Decoder {
             symphonia::default::get_codecs().make(params, &DecoderOptions::default()).map_err(|e| format!("unsupported codec: {e}"))?;
         let sample_rate = params.sample_rate.unwrap_or(44_100);
         let channels = params.channels.map(|c| c.count() as u16).unwrap_or(2);
-        let length_ms = params.n_frames.map(|n| n * 1000 / sample_rate as u64);
+        // `n_frames` is in time-base units (milliseconds for Matroska), not samples.
+        let length_ms = params.n_frames.map(|n| match params.time_base {
+            Some(tb) => {
+                let t = tb.calc_time(n);
+                t.seconds * 1000 + (t.frac * 1000.0) as u64
+            }
+            None => n * 1000 / sample_rate as u64,
+        });
         let codec_name = symphonia::default::get_codecs().get_codec(params.codec).map(|d| d.short_name.to_uppercase()).unwrap_or_default();
         let bitrate_kbps = match (params.bits_per_sample, length_ms, byte_len) {
             // Lossless/PCM: average over the file is the honest figure.
