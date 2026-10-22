@@ -87,6 +87,7 @@ impl Bitmap {
     }
 
     /// Copies a rectangle from `src` (clipped on both sides).
+    #[allow(clippy::too_many_arguments)]
     pub fn blit(&mut self, src: &Bitmap, sx: i32, sy: i32, w: i32, h: i32, dx: i32, dy: i32) {
         for row in 0..h {
             let (syy, dyy) = (sy + row, dy + row);

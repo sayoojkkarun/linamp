@@ -299,9 +299,7 @@ mod tests {
 
     #[test]
     fn defaults_and_round_trip() {
-        let mut s = Settings::default();
-        s.volume = 123;
-        s.titlefmt = "%title%".into();
+        let mut s = Settings { volume: 123, titlefmt: "%title%".into(), ..Default::default() };
         s.set_eq_bands(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 63]);
         let mut ini = Ini::new();
         s.write_ini(&mut ini);

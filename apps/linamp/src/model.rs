@@ -1,0 +1,1420 @@
+//! Application state and command handling, independent of windowing.
+
+use crate::cli::Remote;
+use crate::dialogs::{DialogKind, DialogResult, Request};
+use crate::menu::{MenuAction, MenuItem};
+use crate::vis::Vis;
+use linamp_audio::{Engine, EngineCmd, EngineEvent, EqSettings, PlayState, ReplayGainSettings, StreamInfo};
+use linamp_core::atf::Format;
+use linamp_core::config::{Config, Paths, Settings};
+use linamp_core::eqf::{self, Preset};
+use linamp_core::meta::TrackMeta;
+use linamp_core::playlist::{is_url, Entry, Playlist, SortKey};
+use linamp_core::plformats::{self, is_playlist, Item};
+use linamp_core::text::format_duration_ms;
+use linamp_core::{is_audio_file, Command};
+use linamp_skin::Skin;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use winit::event_loop::EventLoopProxy;
+
+/// Events delivered to the UI thread.
+#[derive(Debug)]
+pub enum AppEvent {
+    Engine(EngineEvent),
+    Meta(u64, Result<TrackMeta, String>),
+    Expanded { items: Vec<Item>, mode: AddMode },
+    Dialog(DialogResult),
+    Remote(crate::ipc::Request),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddMode {
+    ReplaceAndPlay,
+    Append,
+    Insert(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WinKind {
+    Main,
+    Eq,
+    Pl,
+}
+
+/// Things only the windowing layer can do.
+#[derive(Debug)]
+pub enum UiReq {
+    Dialog(DialogKind, Request),
+    Menu(Vec<MenuItem>),
+    /// Window visibility/size/scale changed; re-layout and redraw.
+    Layout,
+    Minimize,
+    Quit,
+    Raise,
+    SkinChanged,
+    AlwaysOnTop,
+}
+
+#[derive(Debug, Default)]
+pub struct Status {
+    pub playing_id: Option<u64>,
+    pub info: Option<StreamInfo>,
+    pub stream_title: Option<String>,
+    pub stream_name: Option<String>,
+}
+
+pub struct Model {
+    pub paths: Paths,
+    pub config: Config,
+    pub playlist: Playlist,
+    pub engine: Engine,
+    pub format: Arc<Format>,
+    pub skin: Skin,
+    pub skin_path: Option<PathBuf>,
+    pub status: Status,
+    pub stop_after_current: bool,
+    /// Temporary marquee text (volume, seek, errors) and when it expires.
+    pub transient: Option<(String, Instant)>,
+    pub eq_presets: Vec<Preset>,
+    pub eq_auto: Vec<Preset>,
+    pub vis: Vis,
+    pub ui: Vec<UiReq>,
+    pub quit: bool,
+    proxy: EventLoopProxy<AppEvent>,
+    meta_tx: crossbeam_channel::Sender<(u64, String)>,
+    error_skips: usize,
+    pub last_dir: Option<PathBuf>,
+    /// Increments when anything visible in the playlist changes.
+    pub pl_dirty: u64,
+}
+
+fn spawn_meta_workers(proxy: EventLoopProxy<AppEvent>) -> crossbeam_channel::Sender<(u64, String)> {
+    let (tx, rx) = crossbeam_channel::unbounded::<(u64, String)>();
+    for i in 0..2 {
+        let rx = rx.clone();
+        let proxy = proxy.clone();
+        let _ = std::thread::Builder::new().name(format!("linamp-meta{i}")).spawn(move || {
+            for (id, path) in rx {
+                let res = linamp_audio::read_meta(Path::new(&path));
+                if proxy.send_event(AppEvent::Meta(id, res)).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    tx
+}
+
+/// Expands files, directories and playlists into playlist items.
+fn expand(locations: Vec<String>, proxy_setting: &str) -> Vec<Item> {
+    let mut out = Vec::new();
+    for loc in locations {
+        if is_url(&loc) {
+            if is_playlist(&loc) {
+                match linamp_audio::stream::fetch_text(&loc, proxy_setting) {
+                    Ok(text) => {
+                        let fmt = plformats::PlaylistFormat::from_path(Path::new(loc.split('?').next().unwrap_or(&loc)))
+                            .or_else(|| plformats::sniff(&text))
+                            .unwrap_or(plformats::PlaylistFormat::M3u);
+                        out.extend(plformats::parse(&text, fmt, None));
+                    }
+                    Err(e) => log::warn!("cannot fetch {loc}: {e}"),
+                }
+            } else {
+                out.push(Item { location: loc, title: None, length_ms: None });
+            }
+            continue;
+        }
+        let path = PathBuf::from(&loc);
+        if path.is_dir() {
+            let mut files = Vec::new();
+            walk(&path, &mut files, 0);
+            files.sort_by(|a, b| linamp_core::text::natural_cmp(a, b));
+            out.extend(files.into_iter().map(|f| Item { location: f, title: None, length_ms: None }));
+        } else if is_playlist(&loc) {
+            match plformats::read_file(&path) {
+                Ok(items) => out.extend(items),
+                Err(e) => log::warn!("cannot read playlist {loc}: {e}"),
+            }
+        } else {
+            out.push(Item { location: loc, title: None, length_ms: None });
+        }
+    }
+    out
+}
+
+fn walk(dir: &Path, out: &mut Vec<String>, depth: usize) {
+    if depth > 32 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_dir() || (ft.is_symlink() && p.is_dir()) {
+            walk(&p, out, depth + 1);
+        } else {
+            let s = p.to_string_lossy().into_owned();
+            if is_audio_file(&s) {
+                out.push(s);
+            }
+        }
+    }
+}
+
+impl Model {
+    pub fn new(paths: Paths, config: Config, proxy: EventLoopProxy<AppEvent>) -> Model {
+        let engine_proxy = proxy.clone();
+        let engine = Engine::spawn("default".into(), move |ev| {
+            let _ = engine_proxy.send_event(AppEvent::Engine(ev));
+        });
+        let meta_tx = spawn_meta_workers(proxy.clone());
+        let eq_presets = eqf::read_file(&paths.eq_library()).unwrap_or_else(|_| eqf::builtin_presets());
+        let eq_auto = eqf::read_file(&paths.eq_auto_library()).unwrap_or_default();
+        let format = Format::cached(&config.settings.titlefmt);
+        let mut m = Model {
+            paths,
+            config,
+            playlist: Playlist::new(),
+            engine,
+            format,
+            skin: Skin::builtin(),
+            skin_path: None,
+            status: Status::default(),
+            stop_after_current: false,
+            transient: None,
+            eq_presets,
+            eq_auto,
+            vis: Vis::new(),
+            ui: Vec::new(),
+            quit: false,
+            proxy,
+            meta_tx,
+            error_skips: 0,
+            last_dir: None,
+            pl_dirty: 0,
+        };
+        let skin = m.settings().skin.clone();
+        if !skin.is_empty() {
+            m.set_skin(Some(PathBuf::from(skin)));
+        }
+        m.push_engine_settings();
+        m
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.config.settings
+    }
+
+    pub fn settings_mut(&mut self) -> &mut Settings {
+        &mut self.config.settings
+    }
+
+    pub fn proxy(&self) -> &EventLoopProxy<AppEvent> {
+        &self.proxy
+    }
+
+    pub fn push_engine_settings(&mut self) {
+        let s = self.settings().clone();
+        self.engine.send(EngineCmd::Volume(s.volume as u8));
+        self.engine.send(EngineCmd::Balance(s.balance as i8));
+        self.engine.send(EngineCmd::Config { buffer_ms: s.buffer_ms, fade_ms: s.fade_ms, proxy: s.proxy.clone() });
+        self.engine.send(EngineCmd::ReplayGain(ReplayGainSettings {
+            enabled: s.replaygain,
+            album: s.replaygain_mode == 1,
+            preamp_db: s.replaygain_preamp,
+            non_rg_db: s.replaygain_non_rg_gain,
+        }));
+        self.push_eq();
+    }
+
+    pub fn eq_settings(&self) -> EqSettings {
+        let s = self.settings();
+        EqSettings {
+            enabled: s.use_eq,
+            iso: s.eq_frequencies == 1,
+            limiter: s.eq_limiter,
+            bands_db: s.eq_bands().map(eqf::value_to_db),
+            preamp_db: eqf::value_to_db(s.preamp as u8),
+        }
+    }
+
+    pub fn push_eq(&mut self) {
+        let eq = self.eq_settings();
+        self.engine.send(EngineCmd::Eq(eq));
+    }
+
+    pub fn state(&self) -> PlayState {
+        self.engine.shared().state()
+    }
+
+    pub fn flash(&mut self, text: impl Into<String>) {
+        self.transient = Some((text.into(), Instant::now() + Duration::from_millis(1500)));
+    }
+
+    // --- playlist ------------------------------------------------------------
+
+    pub fn add(&mut self, locations: Vec<String>, mode: AddMode) {
+        if locations.is_empty() {
+            return;
+        }
+        if let Some(first) = locations.iter().find(|l| !is_url(l)) {
+            let p = PathBuf::from(first);
+            self.last_dir = if p.is_dir() { Some(p) } else { p.parent().map(Path::to_path_buf) };
+        }
+        let proxy = self.proxy.clone();
+        let proxy_setting = self.settings().proxy.clone();
+        let _ = std::thread::Builder::new().name("linamp-expand".into()).spawn(move || {
+            let items = expand(locations, &proxy_setting);
+            let _ = proxy.send_event(AppEvent::Expanded { items, mode });
+        });
+    }
+
+    pub fn on_expanded(&mut self, items: Vec<Item>, mode: AddMode) {
+        let entries: Vec<Entry> = items.into_iter().map(Item::into_entry).collect();
+        if entries.is_empty() {
+            self.flash("NOTHING TO ADD");
+            return;
+        }
+        for e in &entries {
+            if !e.is_url() {
+                let _ = self.meta_tx.send((e.id, e.location.clone()));
+            }
+        }
+        let first_id = entries[0].id;
+        match mode {
+            AddMode::ReplaceAndPlay => {
+                self.engine.send(EngineCmd::Stop);
+                self.playlist.clear();
+                self.playlist.extend(entries);
+            }
+            AddMode::Append => self.playlist.extend(entries),
+            AddMode::Insert(at) => self.playlist.insert(at, entries),
+        }
+        self.pl_dirty += 1;
+        if mode == AddMode::ReplaceAndPlay {
+            if let Some(i) = self.playlist.index_of_id(first_id) {
+                self.play_index(i);
+            }
+        } else {
+            self.update_next();
+        }
+    }
+
+    pub fn on_meta(&mut self, id: u64, meta: Result<TrackMeta, String>) {
+        let fmt = self.format.clone();
+        if let Some(e) = self.playlist.find_mut_by_id(id) {
+            match meta {
+                Ok(m) => {
+                    e.length_ms = m.length_ms.or(e.length_ms);
+                    e.meta = Some(Arc::new(m));
+                    e.refresh_display(&fmt);
+                }
+                Err(err) => log::debug!("no tags for {}: {err}", e.location),
+            }
+            self.pl_dirty += 1;
+        }
+    }
+
+    pub fn set_title_format(&mut self, fmt: &str) {
+        self.settings_mut().titlefmt = fmt.to_string();
+        self.format = Format::cached(fmt);
+        let f = self.format.clone();
+        self.playlist.refresh_all_displays(&f);
+        self.pl_dirty += 1;
+    }
+
+    pub fn save_playlist_file(&self, path: &Path) -> std::io::Result<()> {
+        plformats::write_file(path, &plformats::items_from_entries(self.playlist.entries()))
+    }
+
+    pub fn load_session(&mut self) {
+        let path = self.paths.playlist_file();
+        if let Ok(items) = plformats::read_file(&path) {
+            let entries: Vec<Entry> = items.into_iter().map(Item::into_entry).collect();
+            for e in &entries {
+                if !e.is_url() {
+                    let _ = self.meta_tx.send((e.id, e.location.clone()));
+                }
+            }
+            self.playlist.extend(entries);
+            let pos = self.settings().plpos.max(0) as usize;
+            if pos < self.playlist.len() {
+                self.playlist.set_current(Some(pos));
+                self.playlist.cursor = pos;
+            }
+            self.pl_dirty += 1;
+        }
+    }
+
+    pub fn save_session(&mut self) {
+        self.settings_mut().plpos = self.playlist.current().unwrap_or(0) as i32;
+        if let Err(e) = self.save_playlist_file(&self.paths.playlist_file()) {
+            log::warn!("cannot save playlist: {e}");
+        }
+        if let Err(e) = self.config.save() {
+            log::warn!("cannot save settings to {}: {e}", self.config.path().display());
+        }
+    }
+
+    // --- playback -----------------------------------------------------------
+
+    pub fn play_index(&mut self, idx: usize) {
+        let Some(e) = self.playlist.entry(idx) else { return };
+        let (id, loc) = (e.id, e.location.clone());
+        self.playlist.set_current(Some(idx));
+        self.playlist.cursor = idx;
+        self.status.stream_title = None;
+        self.status.stream_name = None;
+        self.engine.send(EngineCmd::Open { id, location: loc, start_ms: 0 });
+        self.pl_dirty += 1;
+    }
+
+    /// Tells the engine what to continue with when the current track ends.
+    pub fn update_next(&mut self) {
+        let s = self.settings();
+        let (shuffle, repeat, adv) = (s.shuffle, s.repeat, s.pladv);
+        if self.state() == PlayState::Stopped {
+            return;
+        }
+        let next = if adv && !self.stop_after_current {
+            self.playlist.next_index(shuffle, repeat).and_then(|i| self.playlist.entry(i)).map(|e| (e.id, e.location.clone()))
+        } else {
+            None
+        };
+        self.engine.send(EngineCmd::SetNext(next));
+    }
+
+    pub fn play(&mut self) {
+        match self.state() {
+            PlayState::Paused => self.engine.send(EngineCmd::Pause(false)),
+            _ => {
+                let idx = self.playlist.current().or(if self.playlist.is_empty() { None } else { Some(0) });
+                match idx {
+                    Some(i) => self.play_index(i),
+                    None => self.request_dialog(DialogKind::OpenFiles { play: true }),
+                }
+            }
+        }
+    }
+
+    pub fn pause_toggle(&mut self) {
+        match self.state() {
+            PlayState::Playing => self.engine.send(EngineCmd::Pause(true)),
+            PlayState::Paused => self.engine.send(EngineCmd::Pause(false)),
+            PlayState::Stopped => {}
+        }
+    }
+
+    pub fn next(&mut self) {
+        let s = self.settings();
+        let (shuffle, repeat) = (s.shuffle, s.repeat);
+        // Manual "next" always wraps, like the original.
+        if let Some(i) = self.playlist.next_index(shuffle, true).or(if repeat { Some(0) } else { None }) {
+            self.go_to(i);
+        }
+    }
+
+    pub fn prev(&mut self) {
+        let s = self.settings();
+        let shuffle = s.shuffle;
+        if let Some(i) = self.playlist.prev_index(shuffle, true) {
+            self.go_to(i);
+        }
+    }
+
+    /// Plays `i` if something is playing, otherwise just selects it.
+    fn go_to(&mut self, i: usize) {
+        if self.state() == PlayState::Stopped {
+            self.playlist.set_current(Some(i));
+            self.playlist.cursor = i;
+            self.pl_dirty += 1;
+        } else {
+            self.play_index(i);
+        }
+    }
+
+    pub fn seek_relative(&mut self, delta_ms: i64) {
+        if self.state() == PlayState::Stopped {
+            return;
+        }
+        let pos = self.engine.shared().position_ms() as i64;
+        let len = self.engine.shared().length_ms().map(|l| l as i64).unwrap_or(i64::MAX);
+        self.engine.send(EngineCmd::Seek((pos + delta_ms).clamp(0, len.saturating_sub(500).max(0)) as u64));
+    }
+
+    pub fn seek_to(&mut self, ms: u64) {
+        if self.state() != PlayState::Stopped {
+            self.engine.send(EngineCmd::Seek(ms));
+        }
+    }
+
+    pub fn set_volume(&mut self, v: i32) {
+        let v = v.clamp(0, 255);
+        self.settings_mut().volume = v;
+        self.engine.send(EngineCmd::Volume(v as u8));
+        self.flash(format!("VOLUME: {}%", (v * 100 + 127) / 255));
+    }
+
+    pub fn set_balance(&mut self, b: i32) {
+        let b = b.clamp(-127, 127);
+        self.settings_mut().balance = b;
+        self.engine.send(EngineCmd::Balance(b as i8));
+        let pct = (b.abs() * 100 + 63) / 127;
+        self.flash(match b {
+            0 => "BALANCE: CENTER".to_string(),
+            b if b < 0 => format!("BALANCE: {pct}% LEFT"),
+            _ => format!("BALANCE: {pct}% RIGHT"),
+        });
+    }
+
+    pub fn on_engine(&mut self, ev: EngineEvent) {
+        match ev {
+            EngineEvent::Started { id, info, meta, stream } => self.track_started(id, info, meta, stream.and_then(|s| s.name)),
+            EngineEvent::TrackChanged { id, info, meta } => {
+                if let Some(i) = self.playlist.index_of_id(id) {
+                    self.playlist.set_current(Some(i));
+                    self.playlist.cursor = i;
+                }
+                self.track_started(id, info, meta, None)
+            }
+            EngineEvent::Finished { .. } => {
+                self.stop_after_current = false;
+                self.status.playing_id = None;
+                // At the end of the list the cursor returns to the first entry.
+                if !self.playlist.is_empty() && self.settings().pladv {
+                    let last = self.playlist.current() == Some(self.playlist.len() - 1);
+                    if last && !self.settings().repeat && !self.settings().shuffle {
+                        self.playlist.set_current(Some(0));
+                    }
+                }
+                self.pl_dirty += 1;
+            }
+            EngineEvent::Stopped => {
+                self.status.playing_id = None;
+            }
+            EngineEvent::Error { id, message } => {
+                self.flash(format!("ERROR: {message}"));
+                self.status.playing_id = None;
+                let len = self.playlist.len();
+                if self.settings().pladv && self.error_skips < len && len > 1 {
+                    self.error_skips += 1;
+                    if let Some(i) = self.playlist.index_of_id(id) {
+                        self.playlist.set_current(Some(i));
+                        let (shuffle, repeat) = (self.settings().shuffle, self.settings().repeat);
+                        if let Some(n) = self.playlist.next_index(shuffle, repeat) {
+                            self.play_index(n);
+                        }
+                    }
+                }
+            }
+            EngineEvent::StreamTitle { title, .. } => {
+                self.status.stream_title = Some(title);
+            }
+        }
+    }
+
+    fn track_started(&mut self, id: u64, info: StreamInfo, meta: TrackMeta, stream_name: Option<String>) {
+        self.error_skips = 0;
+        self.status.playing_id = Some(id);
+        self.status.info = Some(info.clone());
+        if stream_name.is_some() {
+            self.status.stream_name = stream_name;
+        }
+        let fmt = self.format.clone();
+        let autoload = self.settings().autoload_eq;
+        let mut file_name = None;
+        if let Some(e) = self.playlist.find_mut_by_id(id) {
+            if e.meta.is_none() || e.length_ms.is_none() {
+                e.length_ms = info.length_ms.or(e.length_ms);
+                if !e.is_url() || meta.title.is_some() {
+                    e.meta = Some(Arc::new(meta));
+                }
+                e.refresh_display(&fmt);
+            }
+            file_name = Some(e.location.rsplit('/').next().unwrap_or("").to_string());
+        }
+        if autoload {
+            if let Some(name) = file_name {
+                if let Some(p) = self.eq_auto.iter().find(|p| p.name.eq_ignore_ascii_case(&name)).cloned() {
+                    self.apply_preset(&p);
+                }
+            }
+        }
+        self.pl_dirty += 1;
+        self.update_next();
+    }
+
+    pub fn current_title(&self) -> String {
+        let Some(e) = self.playlist.current_entry() else { return String::new() };
+        let title = match (&self.status.stream_title, self.status.playing_id == Some(e.id)) {
+            (Some(t), true) => t.clone(),
+            _ => e.display.clone(),
+        };
+        let idx = self.playlist.current().unwrap_or(0) + 1;
+        match e.length_ms {
+            Some(l) => format!("{idx}. {title} ({})", format_duration_ms(l)),
+            None => format!("{idx}. {title}"),
+        }
+    }
+
+    // --- equalizer ----------------------------------------------------------
+
+    pub fn set_eq_band(&mut self, band: usize, value: i32) {
+        let mut bands = self.settings().eq_bands();
+        bands[band] = value.clamp(0, 63) as u8;
+        self.settings_mut().set_eq_bands(&bands);
+        self.push_eq();
+        self.flash(format!("EQ: {:+.1} DB", eqf::value_to_db(bands[band])));
+    }
+
+    pub fn set_preamp(&mut self, value: i32) {
+        self.settings_mut().preamp = value.clamp(0, 63);
+        self.push_eq();
+        self.flash(format!("PREAMP: {:+.1} DB", eqf::value_to_db(value.clamp(0, 63) as u8)));
+    }
+
+    pub fn apply_preset(&mut self, p: &Preset) {
+        self.settings_mut().set_eq_bands(&p.bands);
+        self.settings_mut().preamp = p.preamp as i32;
+        self.push_eq();
+    }
+
+    pub fn current_preset(&self, name: &str) -> Preset {
+        Preset { name: name.to_string(), bands: self.settings().eq_bands(), preamp: self.settings().preamp as u8 }
+    }
+
+    fn save_eq_libraries(&self) {
+        if let Err(e) = eqf::write_file(&self.paths.eq_library(), &self.eq_presets) {
+            log::warn!("cannot save EQ presets: {e}");
+        }
+        if let Err(e) = eqf::write_file(&self.paths.eq_auto_library(), &self.eq_auto) {
+            log::warn!("cannot save EQ auto presets: {e}");
+        }
+    }
+
+    // --- skins ---------------------------------------------------------------
+
+    pub fn set_skin(&mut self, path: Option<PathBuf>) {
+        match &path {
+            None => self.skin = Skin::builtin(),
+            Some(p) => match Skin::load(p) {
+                Ok(s) => self.skin = s,
+                Err(e) => {
+                    self.flash(format!("SKIN ERROR: {e}"));
+                    return;
+                }
+            },
+        }
+        self.settings_mut().skin = path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        self.skin_path = path;
+        self.ui.push(UiReq::SkinChanged);
+    }
+
+    // --- dialogs ---------------------------------------------------------------
+
+    fn start_dir(&self) -> Option<PathBuf> {
+        self.last_dir.clone().or_else(|| std::env::var_os("HOME").map(PathBuf::from).map(|h| {
+            let music = h.join("Music");
+            if music.is_dir() {
+                music
+            } else {
+                h
+            }
+        }))
+    }
+
+    pub fn request_dialog(&mut self, kind: DialogKind) {
+        let media_filter: Vec<String> =
+            linamp_core::AUDIO_EXTENSIONS.iter().chain(["m3u", "m3u8", "pls", "xspf"].iter()).map(|e| format!("*.{e}")).collect();
+        let start = self.start_dir();
+        let req = match &kind {
+            DialogKind::OpenFiles { .. } => Request::Files { title: "Open file(s)".into(), multiple: true, filter: media_filter, start },
+            DialogKind::OpenFolder { .. } => Request::Folder { title: "Open folder".into(), start },
+            DialogKind::OpenUrl { .. } => Request::Entry {
+                title: "Open URL".into(),
+                text: "Enter a URL to open (e.g. http://server:8000/stream):".into(),
+                initial: String::new(),
+            },
+            DialogKind::LoadPlaylist => Request::Files {
+                title: "Load playlist".into(),
+                multiple: false,
+                filter: ["*.m3u", "*.m3u8", "*.pls", "*.xspf"].map(String::from).to_vec(),
+                start,
+            },
+            DialogKind::SavePlaylist => Request::Save { title: "Save playlist".into(), name: "playlist.m3u8".into(), start },
+            DialogKind::JumpToTime => {
+                let len = self.engine.shared().length_ms().map(format_duration_ms).unwrap_or_else(|| "?".into());
+                Request::Entry { title: "Jump to time".into(), text: format!("Jump to (m:ss), track length {len}:"), initial: String::new() }
+            }
+            DialogKind::JumpToFile => Request::List {
+                title: "Jump to file".into(),
+                column: "Title".into(),
+                rows: self.playlist.entries().iter().enumerate().map(|(i, e)| format!("{}. {}", i + 1, e.display)).collect(),
+            },
+            DialogKind::EditEntry { id } => {
+                let loc = self.playlist.index_of_id(*id).and_then(|i| self.playlist.entry(i)).map(|e| e.location.clone()).unwrap_or_default();
+                Request::Entry { title: "Edit playlist entry".into(), text: "Location:".into(), initial: loc }
+            }
+            DialogKind::EqLoadPreset { auto } | DialogKind::EqDeletePreset { auto } => {
+                let list = if *auto { &self.eq_auto } else { &self.eq_presets };
+                Request::List { title: "EQ presets".into(), column: "Preset".into(), rows: list.iter().map(|p| p.name.clone()).collect() }
+            }
+            DialogKind::EqSavePreset { auto } => {
+                let initial = if *auto {
+                    self.playlist.current_entry().map(|e| e.location.rsplit('/').next().unwrap_or("").to_string()).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                Request::Entry { title: "Save EQ preset".into(), text: "Preset name:".into(), initial }
+            }
+            DialogKind::EqImport => {
+                Request::Files { title: "Load EQ preset file".into(), multiple: false, filter: vec!["*.eqf".into(), "*.q1".into()], start }
+            }
+            DialogKind::EqExport => Request::Save { title: "Save EQ preset file".into(), name: "preset.eqf".into(), start },
+            DialogKind::Skin => {
+                let mut rows = vec!["<Linamp Default>".to_string()];
+                rows.extend(linamp_skin::list_skins(&self.paths.skins_dir()).iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned()));
+                rows.push("<Install skin from file…>".into());
+                Request::List { title: "Skin browser".into(), column: "Skin".into(), rows }
+            }
+            DialogKind::InstallSkin => Request::Files { title: "Install skin".into(), multiple: false, filter: vec!["*.wsz".into(), "*.zip".into()], start },
+            DialogKind::Info => Request::Info { title: "File info".into(), text: self.file_info_text() },
+            DialogKind::ConfirmPhysicalRemove { paths } => Request::Question {
+                title: "Delete files".into(),
+                text: format!("Permanently delete {} file(s) from disk?\n\n{}", paths.len(), paths.iter().take(10).cloned().collect::<Vec<_>>().join("\n")),
+            },
+        };
+        self.ui.push(UiReq::Dialog(kind, req));
+    }
+
+    fn file_info_text(&self) -> String {
+        let idx = self.playlist.selected_indices().first().copied().or(self.playlist.current());
+        let Some(e) = idx.and_then(|i| self.playlist.entry(i)) else { return "No file selected.".into() };
+        let mut lines = vec![format!("Location: {}", e.location)];
+        if let Some(m) = &e.meta {
+            let fields = [
+                ("Title", &m.title),
+                ("Artist", &m.artist),
+                ("Album", &m.album),
+                ("Album artist", &m.album_artist),
+                ("Year", &m.year),
+                ("Track", &m.track),
+                ("Disc", &m.disc),
+                ("Genre", &m.genre),
+                ("Composer", &m.composer),
+                ("Comment", &m.comment),
+                ("Codec", &m.codec),
+            ];
+            for (k, v) in fields {
+                if let Some(v) = v {
+                    lines.push(format!("{k}: {v}"));
+                }
+            }
+            if let Some(l) = m.length_ms {
+                lines.push(format!("Length: {}", format_duration_ms(l)));
+            }
+            if let (Some(r), Some(c)) = (m.sample_rate, m.channels) {
+                lines.push(format!("Format: {r} Hz, {c} channel(s){}", m.bitrate_kbps.map(|b| format!(", {b} kbps")).unwrap_or_default()));
+            }
+            if let Some(g) = m.replaygain_track_gain {
+                lines.push(format!("ReplayGain (track): {g:+.2} dB"));
+            }
+        }
+        if self.status.playing_id == Some(e.id) {
+            if let Some(n) = &self.status.stream_name {
+                lines.push(format!("Station: {n}"));
+            }
+            if let Some(t) = &self.status.stream_title {
+                lines.push(format!("Now playing: {t}"));
+            }
+        }
+        lines.join("\n")
+    }
+
+    pub fn on_dialog(&mut self, r: DialogResult) {
+        let first = r.values.first().cloned();
+        match r.kind {
+            DialogKind::OpenFiles { play } | DialogKind::OpenFolder { play } | DialogKind::OpenUrl { play } => {
+                let vals: Vec<String> = r.values.into_iter().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect();
+                self.add(vals, if play { AddMode::ReplaceAndPlay } else { AddMode::Append });
+            }
+            DialogKind::LoadPlaylist => {
+                if let Some(f) = first {
+                    self.add(vec![f], AddMode::ReplaceAndPlay);
+                }
+            }
+            DialogKind::SavePlaylist => {
+                if let Some(f) = first {
+                    let mut p = PathBuf::from(f);
+                    if plformats::PlaylistFormat::from_path(&p).is_none() {
+                        p.set_extension("m3u8");
+                    }
+                    if let Err(e) = self.save_playlist_file(&p) {
+                        self.flash(format!("SAVE FAILED: {e}"));
+                    }
+                }
+            }
+            DialogKind::JumpToTime => {
+                if let Some(ms) = first.as_deref().and_then(crate::dialogs::parse_time) {
+                    self.seek_to(ms);
+                }
+            }
+            DialogKind::JumpToFile => {
+                if let Some(i) = first.and_then(|s| s.trim().parse::<usize>().ok()) {
+                    self.play_index(i);
+                }
+            }
+            DialogKind::EditEntry { id } => {
+                if let Some(loc) = first.filter(|l| !l.trim().is_empty()) {
+                    let fmt = self.format.clone();
+                    if let Some(e) = self.playlist.find_mut_by_id(id) {
+                        e.location = loc.trim().to_string();
+                        e.meta = None;
+                        e.file_title = None;
+                        e.refresh_display(&fmt);
+                        if !e.is_url() {
+                            let _ = self.meta_tx.send((e.id, e.location.clone()));
+                        }
+                    }
+                    self.pl_dirty += 1;
+                }
+            }
+            DialogKind::EqLoadPreset { auto } => {
+                let list = if auto { &self.eq_auto } else { &self.eq_presets };
+                if let Some(p) = first.and_then(|s| s.trim().parse::<usize>().ok()).and_then(|i| list.get(i)).cloned() {
+                    self.apply_preset(&p);
+                }
+            }
+            DialogKind::EqDeletePreset { auto } => {
+                if let Some(i) = first.and_then(|s| s.trim().parse::<usize>().ok()) {
+                    let list = if auto { &mut self.eq_auto } else { &mut self.eq_presets };
+                    if i < list.len() {
+                        list.remove(i);
+                        self.save_eq_libraries();
+                    }
+                }
+            }
+            DialogKind::EqSavePreset { auto } => {
+                if let Some(name) = first.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                    let preset = self.current_preset(&name);
+                    let list = if auto { &mut self.eq_auto } else { &mut self.eq_presets };
+                    match list.iter_mut().find(|p| p.name.eq_ignore_ascii_case(&name)) {
+                        Some(p) => *p = preset,
+                        None => list.push(preset),
+                    }
+                    self.save_eq_libraries();
+                }
+            }
+            DialogKind::EqImport => {
+                if let Some(f) = first {
+                    match eqf::read_file(Path::new(&f)) {
+                        Ok(presets) if !presets.is_empty() => self.apply_preset(&presets[0]),
+                        Ok(_) => self.flash("EMPTY EQ FILE"),
+                        Err(e) => self.flash(format!("EQ FILE ERROR: {e}")),
+                    }
+                }
+            }
+            DialogKind::EqExport => {
+                if let Some(f) = first {
+                    let mut p = PathBuf::from(f);
+                    if p.extension().is_none() {
+                        p.set_extension("eqf");
+                    }
+                    let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    if let Err(e) = eqf::write_file(&p, &[self.current_preset(&name)]) {
+                        self.flash(format!("SAVE FAILED: {e}"));
+                    }
+                }
+            }
+            DialogKind::Skin => {
+                let skins = linamp_skin::list_skins(&self.paths.skins_dir());
+                match first.and_then(|s| s.trim().parse::<usize>().ok()) {
+                    Some(0) => self.set_skin(None),
+                    Some(i) if i <= skins.len() => self.set_skin(Some(skins[i - 1].clone())),
+                    Some(_) => self.request_dialog(DialogKind::InstallSkin),
+                    None => {}
+                }
+            }
+            DialogKind::InstallSkin => {
+                if let Some(f) = first {
+                    self.install_skin(Path::new(&f));
+                }
+            }
+            DialogKind::Info => {}
+            DialogKind::ConfirmPhysicalRemove { paths } => {
+                if first.as_deref() == Some("yes") {
+                    for p in &paths {
+                        if let Err(e) = std::fs::remove_file(p) {
+                            log::warn!("cannot delete {p}: {e}");
+                        }
+                    }
+                    self.playlist.remove_selected();
+                    self.pl_dirty += 1;
+                }
+            }
+        }
+    }
+
+    pub fn install_skin(&mut self, src: &Path) {
+        let dir = self.paths.skins_dir();
+        let Some(name) = src.file_name() else { return };
+        let dest = dir.join(name);
+        let res = std::fs::create_dir_all(&dir).and_then(|_| if src != dest { std::fs::copy(src, &dest).map(|_| ()) } else { Ok(()) });
+        match res {
+            Ok(()) => self.set_skin(Some(dest)),
+            Err(e) => self.flash(format!("INSTALL FAILED: {e}")),
+        }
+    }
+
+    // --- commands ---------------------------------------------------------------
+
+    pub fn exec(&mut self, cmd: Command) {
+        use Command as C;
+        match cmd {
+            C::Exit => {
+                self.quit = true;
+                self.ui.push(UiReq::Quit);
+            }
+            C::Play => self.play(),
+            C::Pause => self.pause_toggle(),
+            C::PlayPause => match self.state() {
+                PlayState::Stopped => self.play(),
+                _ => self.pause_toggle(),
+            },
+            C::Stop => self.engine.send(EngineCmd::Stop),
+            C::StopFadeout => self.engine.send(EngineCmd::StopFade),
+            C::StopAfterCurrent => {
+                self.stop_after_current = !self.stop_after_current;
+                self.flash(if self.stop_after_current { "STOP AFTER CURRENT: ON" } else { "STOP AFTER CURRENT: OFF" });
+                self.update_next();
+            }
+            C::Next => self.next(),
+            C::Previous => self.prev(),
+            C::Back5s | C::Rewind5s => self.seek_relative(-5000),
+            C::Fwd5s | C::Forward5s => self.seek_relative(5000),
+            C::StartOfList => {
+                if !self.playlist.is_empty() {
+                    self.go_to(0)
+                }
+            }
+            C::EndOfList => {
+                if !self.playlist.is_empty() {
+                    self.go_to(self.playlist.len() - 1)
+                }
+            }
+            C::TenTracksBack | C::TenTracksForward => {
+                if !self.playlist.is_empty() {
+                    let cur = self.playlist.current().unwrap_or(0) as i64;
+                    let d = if cmd == C::TenTracksBack { -10 } else { 10 };
+                    self.go_to((cur + d).clamp(0, self.playlist.len() as i64 - 1) as usize);
+                }
+            }
+            C::VolumeUp => self.set_volume(self.settings().volume + 5),
+            C::VolumeDown => self.set_volume(self.settings().volume - 5),
+            C::BalanceLeft => self.set_balance(self.settings().balance - 8),
+            C::BalanceRight => self.set_balance(self.settings().balance + 8),
+            C::ToggleRepeat => {
+                let v = !self.settings().repeat;
+                self.settings_mut().repeat = v;
+                self.update_next();
+            }
+            C::ToggleShuffle => {
+                let v = !self.settings().shuffle;
+                self.settings_mut().shuffle = v;
+                self.update_next();
+            }
+            C::ToggleManualAdvance => {
+                let v = !self.settings().pladv;
+                self.settings_mut().pladv = v;
+                self.flash(if v { "MANUAL ADVANCE: OFF" } else { "MANUAL ADVANCE: ON" });
+                self.update_next();
+            }
+            C::OpenFile => self.request_dialog(DialogKind::OpenFiles { play: true }),
+            C::OpenFolder => self.request_dialog(DialogKind::OpenFolder { play: true }),
+            C::OpenUrl => self.request_dialog(DialogKind::OpenUrl { play: true }),
+            C::PlAddFiles => self.request_dialog(DialogKind::OpenFiles { play: false }),
+            C::PlAddFolder => self.request_dialog(DialogKind::OpenFolder { play: false }),
+            C::PlAddUrl => self.request_dialog(DialogKind::OpenUrl { play: false }),
+            C::PlaylistOpen => self.request_dialog(DialogKind::LoadPlaylist),
+            C::PlaylistSave => self.request_dialog(DialogKind::SavePlaylist),
+            C::JumpToTime => self.request_dialog(DialogKind::JumpToTime),
+            C::JumpToFile => self.request_dialog(DialogKind::JumpToFile),
+            C::FileInfo => self.request_dialog(DialogKind::Info),
+            C::EditPlaylistEntry => {
+                let idx = self.playlist.selected_indices().first().copied().or(self.playlist.current());
+                if let Some(id) = idx.and_then(|i| self.playlist.entry(i)).map(|e| e.id) {
+                    self.request_dialog(DialogKind::EditEntry { id });
+                }
+            }
+            C::SkinBrowser => self.request_dialog(DialogKind::Skin),
+            C::EqPresetLoad => self.request_dialog(DialogKind::EqLoadPreset { auto: false }),
+            C::EqPresetSave => self.request_dialog(DialogKind::EqSavePreset { auto: false }),
+            C::EqPresetDelete => self.request_dialog(DialogKind::EqDeletePreset { auto: false }),
+            C::EqImportEqf => self.request_dialog(DialogKind::EqImport),
+            C::EqExportEqf => self.request_dialog(DialogKind::EqExport),
+            C::EqReset => {
+                self.settings_mut().set_eq_bands(&[31; 10]);
+                self.settings_mut().preamp = 31;
+                self.push_eq();
+            }
+            C::ToggleEq => {
+                let v = !self.settings().use_eq;
+                self.settings_mut().use_eq = v;
+                self.push_eq();
+            }
+            C::ToggleEqAutoload => {
+                let v = !self.settings().autoload_eq;
+                self.settings_mut().autoload_eq = v;
+            }
+            C::ClearPlaylist => {
+                self.playlist.clear();
+                self.pl_dirty += 1;
+                self.update_next();
+            }
+            C::PlRemoveSelected => {
+                self.playlist.remove_selected();
+                self.pl_dirty += 1;
+                self.update_next();
+            }
+            C::PlCropSelected => {
+                self.playlist.crop_selected();
+                self.pl_dirty += 1;
+                self.update_next();
+            }
+            C::RemoveMissing => {
+                self.playlist.remove_missing();
+                self.pl_dirty += 1;
+            }
+            C::PhysicallyRemove => {
+                let paths: Vec<String> =
+                    self.playlist.selected_indices().iter().filter_map(|&i| self.playlist.entry(i)).filter(|e| !e.is_url()).map(|e| e.location.clone()).collect();
+                if !paths.is_empty() {
+                    self.request_dialog(DialogKind::ConfirmPhysicalRemove { paths });
+                }
+            }
+            C::SelectAll => {
+                self.playlist.select_all(true);
+                self.pl_dirty += 1;
+            }
+            C::SelectNone => {
+                self.playlist.select_all(false);
+                self.pl_dirty += 1;
+            }
+            C::InvertSelection => {
+                self.playlist.invert_selection();
+                self.pl_dirty += 1;
+            }
+            C::SortByTitle | C::SortByFileName | C::SortByPath => {
+                self.playlist.sort(match cmd {
+                    C::SortByTitle => SortKey::Title,
+                    C::SortByFileName => SortKey::FileName,
+                    _ => SortKey::Path,
+                });
+                self.pl_dirty += 1;
+                self.update_next();
+            }
+            C::ReverseList => {
+                self.playlist.reverse();
+                self.pl_dirty += 1;
+                self.update_next();
+            }
+            C::RandomizeList => {
+                self.playlist.randomize();
+                self.pl_dirty += 1;
+                self.update_next();
+            }
+            C::MoveSelectionUp | C::MoveSelectionDown => {
+                self.playlist.move_selected(if cmd == C::MoveSelectionUp { -1 } else { 1 });
+                self.pl_dirty += 1;
+                self.update_next();
+            }
+            C::PlaySelected => {
+                let idx = self.playlist.selected_indices().first().copied().unwrap_or(self.playlist.cursor);
+                self.play_index(idx);
+            }
+            C::TimeElapsed => self.settings_mut().timeleftmode = false,
+            C::TimeRemaining => self.settings_mut().timeleftmode = true,
+            C::ToggleTimeMode => {
+                let v = !self.settings().timeleftmode;
+                self.settings_mut().timeleftmode = v;
+            }
+            C::ToggleAutoscroll => {
+                let v = !self.settings().autoscrollname;
+                self.settings_mut().autoscrollname = v;
+            }
+            C::CycleVisMode => {
+                let v = (self.settings().sa + 1) % 3;
+                self.settings_mut().sa = v;
+            }
+            C::ToggleAlwaysOnTop => {
+                let v = !self.settings().aot;
+                self.settings_mut().aot = v;
+                self.ui.push(UiReq::AlwaysOnTop);
+            }
+            C::ToggleDoubleSize => {
+                let v = !self.settings().dsize;
+                self.settings_mut().dsize = v;
+                self.ui.push(UiReq::Layout);
+            }
+            C::ToggleEasyMove => {
+                let v = !self.settings().easymove;
+                self.settings_mut().easymove = v;
+            }
+            C::ToggleWindowshade => {
+                let v = !self.settings().windowshade;
+                self.settings_mut().windowshade = v;
+                self.ui.push(UiReq::Layout);
+            }
+            C::ToggleEqShade => {
+                let v = !self.settings().eq_ws;
+                self.settings_mut().eq_ws = v;
+                self.ui.push(UiReq::Layout);
+            }
+            C::TogglePlShade => {
+                let v = !self.settings().pe_ws;
+                self.settings_mut().pe_ws = v;
+                self.ui.push(UiReq::Layout);
+            }
+            C::ToggleEqWindow => {
+                let v = !self.settings().eq_open;
+                self.settings_mut().eq_open = v;
+                self.ui.push(UiReq::Layout);
+            }
+            C::TogglePlaylistWindow => {
+                let v = !self.settings().pe_open;
+                self.settings_mut().pe_open = v;
+                self.ui.push(UiReq::Layout);
+            }
+            C::ToggleMainWindow => self.ui.push(UiReq::Raise),
+            C::Minimize => self.ui.push(UiReq::Minimize),
+            C::Preferences | C::SelectVisPlugin => {
+                self.ui.push(UiReq::Menu(self.options_menu()));
+            }
+            C::ToggleVis => self.exec(C::CycleVisMode),
+            C::About => {
+                let text = format!(
+                    "Linamp {}\n\nA Winamp-style audio player for Linux, written in Rust.\nDecoding by Symphonia. Classic skins (.wsz) supported.\n\nConfig: {}",
+                    env!("CARGO_PKG_VERSION"),
+                    self.config.path().display()
+                );
+                self.ui.push(UiReq::Dialog(DialogKind::Info, Request::Info { title: "About Linamp".into(), text }));
+            }
+        }
+    }
+
+    pub fn on_menu(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::Cmd(c) => self.exec(c),
+            MenuAction::Skin(p) => self.set_skin(p),
+            MenuAction::VisMode(m) => self.settings_mut().sa = m,
+            MenuAction::SaStyle(s) => self.settings_mut().sa_style = s,
+            MenuAction::OscStyle(s) => self.settings_mut().osc_style = s,
+            MenuAction::SaPeaks => {
+                let v = !self.settings().sa_peaks;
+                self.settings_mut().sa_peaks = v;
+            }
+            MenuAction::SaThick => {
+                let v = !self.settings().sa_thick;
+                self.settings_mut().sa_thick = v;
+            }
+            MenuAction::EqBands(iso) => {
+                self.settings_mut().eq_frequencies = iso as i32;
+                self.push_eq();
+            }
+            MenuAction::EqLimiter => {
+                let v = !self.settings().eq_limiter;
+                self.settings_mut().eq_limiter = v;
+                self.push_eq();
+            }
+            MenuAction::ReplayGain(mode) => {
+                let s = self.settings_mut();
+                match mode {
+                    None => s.replaygain = false,
+                    Some(m) => {
+                        s.replaygain = true;
+                        s.replaygain_mode = m;
+                    }
+                }
+                self.push_engine_settings();
+            }
+            MenuAction::TitleFormat(f) => self.set_title_format(&f),
+            MenuAction::EqPreset(i, auto) => {
+                let list = if auto { &self.eq_auto } else { &self.eq_presets };
+                if let Some(p) = list.get(i).cloned() {
+                    self.apply_preset(&p);
+                }
+            }
+            MenuAction::EqDialog(kind) => self.request_dialog(kind),
+            MenuAction::PlaySelected => self.exec(Command::PlaySelected),
+        }
+    }
+
+    // --- menus -------------------------------------------------------------------
+
+    pub fn main_menu(&self) -> Vec<MenuItem> {
+        use Command as C;
+        let s = self.settings();
+        let st = self.state();
+        vec![
+            MenuItem::cmd("About Linamp…", "Ctrl+F1", C::About),
+            MenuItem::sep(),
+            MenuItem::sub(
+                "Play",
+                vec![
+                    MenuItem::cmd("File…", "L", C::OpenFile),
+                    MenuItem::cmd("URL…", "Ctrl+L", C::OpenUrl),
+                    MenuItem::cmd("Folder…", "Shift+L", C::OpenFolder),
+                ],
+            ),
+            MenuItem::cmd("View file info…", "Alt+3", C::FileInfo),
+            MenuItem::sep(),
+            MenuItem::cmd("Main Window", "Alt+W", C::ToggleMainWindow),
+            MenuItem::cmd("Playlist Editor", "Alt+E", C::TogglePlaylistWindow).checked(s.pe_open),
+            MenuItem::cmd("Equalizer", "Alt+G", C::ToggleEqWindow).checked(s.eq_open),
+            MenuItem::sep(),
+            MenuItem::sub("Options", self.options_menu()),
+            MenuItem::sub(
+                "Playback",
+                vec![
+                    MenuItem::cmd("Previous", "Z", C::Previous),
+                    MenuItem::cmd("Play", "X", C::Play),
+                    MenuItem::cmd("Pause", "C", C::Pause).checked(st == PlayState::Paused),
+                    MenuItem::cmd("Stop", "V", C::Stop),
+                    MenuItem::cmd("Next", "B", C::Next),
+                    MenuItem::sep(),
+                    MenuItem::cmd("Stop w/ fadeout", "Shift+V", C::StopFadeout),
+                    MenuItem::cmd("Stop after current", "Ctrl+V", C::StopAfterCurrent).checked(self.stop_after_current),
+                    MenuItem::cmd("Back 5 seconds", "Left", C::Back5s),
+                    MenuItem::cmd("Fwd 5 seconds", "Right", C::Fwd5s),
+                    MenuItem::cmd("Start of list", "Ctrl+Z", C::StartOfList),
+                    MenuItem::cmd("End of list", "Ctrl+B", C::EndOfList),
+                    MenuItem::cmd("10 tracks back", "Num 1", C::TenTracksBack),
+                    MenuItem::cmd("10 tracks fwd", "Num 3", C::TenTracksForward),
+                    MenuItem::sep(),
+                    MenuItem::cmd("Jump to time…", "Ctrl+J", C::JumpToTime),
+                    MenuItem::cmd("Jump to file…", "J", C::JumpToFile),
+                ],
+            ),
+            MenuItem::sub("Visualization", self.vis_menu()),
+            MenuItem::sub("Skins", self.skins_menu()),
+            MenuItem::sep(),
+            MenuItem::cmd("Exit", "Alt+F4", C::Exit),
+        ]
+    }
+
+    pub fn options_menu(&self) -> Vec<MenuItem> {
+        use Command as C;
+        let s = self.settings();
+        let fmt = |label: &str, f: &str| {
+            MenuItem::action(label, "", MenuAction::TitleFormat(f.to_string())).checked(s.titlefmt == f)
+        };
+        vec![
+            MenuItem::cmd("Skin browser…", "Alt+S", C::SkinBrowser),
+            MenuItem::sep(),
+            MenuItem::cmd("Time elapsed", "Ctrl+T", C::TimeElapsed).checked(!s.timeleftmode),
+            MenuItem::cmd("Time remaining", "Ctrl+T", C::TimeRemaining).checked(s.timeleftmode),
+            MenuItem::sep(),
+            MenuItem::cmd("Always On Top", "Ctrl+A", C::ToggleAlwaysOnTop).checked(s.aot),
+            MenuItem::cmd("Double Size", "Ctrl+D", C::ToggleDoubleSize).checked(s.dsize),
+            MenuItem::cmd("EasyMove", "Ctrl+E", C::ToggleEasyMove).checked(s.easymove),
+            MenuItem::cmd("Windowshade", "Ctrl+W", C::ToggleWindowshade).checked(s.windowshade),
+            MenuItem::sep(),
+            MenuItem::cmd("Repeat", "R", C::ToggleRepeat).checked(s.repeat),
+            MenuItem::cmd("Shuffle", "S", C::ToggleShuffle).checked(s.shuffle),
+            MenuItem::cmd("Manual playlist advance", "Shift+R", C::ToggleManualAdvance).checked(!s.pladv),
+            MenuItem::sep(),
+            MenuItem::sub(
+                "ReplayGain",
+                vec![
+                    MenuItem::action("Off", "", MenuAction::ReplayGain(None)).checked(!s.replaygain),
+                    MenuItem::action("Track gain", "", MenuAction::ReplayGain(Some(0))).checked(s.replaygain && s.replaygain_mode == 0),
+                    MenuItem::action("Album gain", "", MenuAction::ReplayGain(Some(1))).checked(s.replaygain && s.replaygain_mode == 1),
+                ],
+            ),
+            MenuItem::sub(
+                "Title format",
+                vec![
+                    fmt("Artist - Title", linamp_core::config::DEFAULT_TITLE_FORMAT),
+                    fmt("Artist - Album - ## - Title", "[%artist% - ][%album% - ][$num(%track%,2) - ]$if2(%title%,$filepart(%filename%))"),
+                    fmt("Title", "$if2(%title%,$filepart(%filename%))"),
+                    fmt("File name", "$filepart(%filename%)"),
+                ],
+            ),
+            MenuItem::sub(
+                "Equalizer",
+                vec![
+                    MenuItem::action("Winamp bands (60Hz-16kHz)", "", MenuAction::EqBands(false)).checked(s.eq_frequencies == 0),
+                    MenuItem::action("ISO bands (31Hz-16kHz)", "", MenuAction::EqBands(true)).checked(s.eq_frequencies == 1),
+                    MenuItem::sep(),
+                    MenuItem::action("Limiter (prevents clipping)", "", MenuAction::EqLimiter).checked(s.eq_limiter),
+                ],
+            ),
+        ]
+    }
+
+    pub fn vis_menu(&self) -> Vec<MenuItem> {
+        let s = self.settings();
+        vec![
+            MenuItem::action("Spectrum analyzer", "", MenuAction::VisMode(1)).checked(s.sa == 1),
+            MenuItem::action("Oscilloscope", "", MenuAction::VisMode(2)).checked(s.sa == 2),
+            MenuItem::action("Off", "", MenuAction::VisMode(0)).checked(s.sa == 0),
+            MenuItem::sep(),
+            MenuItem::action("Normal style", "", MenuAction::SaStyle(0)).checked(s.sa_style == 0),
+            MenuItem::action("Fire style", "", MenuAction::SaStyle(1)).checked(s.sa_style == 1),
+            MenuItem::action("Line style", "", MenuAction::SaStyle(2)).checked(s.sa_style == 2),
+            MenuItem::action("Show peaks", "", MenuAction::SaPeaks).checked(s.sa_peaks),
+            MenuItem::action("Thick bands", "", MenuAction::SaThick).checked(s.sa_thick),
+            MenuItem::sep(),
+            MenuItem::action("Scope: dots", "", MenuAction::OscStyle(0)).checked(s.osc_style == 0),
+            MenuItem::action("Scope: lines", "", MenuAction::OscStyle(1)).checked(s.osc_style == 1),
+            MenuItem::action("Scope: solid", "", MenuAction::OscStyle(2)).checked(s.osc_style == 2),
+        ]
+    }
+
+    pub fn skins_menu(&self) -> Vec<MenuItem> {
+        let mut items = vec![MenuItem::cmd("Skin browser…", "Alt+S", Command::SkinBrowser), MenuItem::sep()];
+        items.push(MenuItem::action("Linamp Default", "", MenuAction::Skin(None)).checked(self.skin_path.is_none()));
+        for p in linamp_skin::list_skins(&self.paths.skins_dir()).into_iter().take(40) {
+            let name = p.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            let checked = self.skin_path.as_deref() == Some(p.as_path());
+            items.push(MenuItem::action(&name, "", MenuAction::Skin(Some(p))).checked(checked));
+        }
+        items
+    }
+
+    pub fn eq_presets_menu(&self) -> Vec<MenuItem> {
+        let presets = |auto: bool| -> Vec<MenuItem> {
+            let list = if auto { &self.eq_auto } else { &self.eq_presets };
+            let mut v: Vec<MenuItem> = list.iter().enumerate().take(40).map(|(i, p)| MenuItem::action(&p.name, "", MenuAction::EqPreset(i, auto))).collect();
+            if v.is_empty() {
+                v.push(MenuItem::label("(none)"));
+            }
+            v
+        };
+        vec![
+            MenuItem::sub("Load", {
+                let mut v = presets(false);
+                v.push(MenuItem::sep());
+                v.push(MenuItem::sub("Auto-load presets", presets(true)));
+                v.push(MenuItem::cmd("From EQF…", "", Command::EqImportEqf));
+                v
+            }),
+            MenuItem::sub(
+                "Save",
+                vec![
+                    MenuItem::cmd("Preset…", "", Command::EqPresetSave),
+                    MenuItem::action("Auto-load preset…", "", MenuAction::EqDialog(DialogKind::EqSavePreset { auto: true })),
+                    MenuItem::sep(),
+                    MenuItem::cmd("To EQF…", "", Command::EqExportEqf),
+                ],
+            ),
+            MenuItem::sub(
+                "Delete",
+                vec![
+                    MenuItem::cmd("Preset…", "", Command::EqPresetDelete),
+                    MenuItem::action("Auto-load preset…", "", MenuAction::EqDialog(DialogKind::EqDeletePreset { auto: true })),
+                ],
+            ),
+            MenuItem::sep(),
+            MenuItem::cmd("Reset to flat", "", Command::EqReset),
+        ]
+    }
+
+    pub fn playlist_row_menu(&self) -> Vec<MenuItem> {
+        use Command as C;
+        vec![
+            MenuItem::action("Play item", "Enter", MenuAction::PlaySelected),
+            MenuItem::sep(),
+            MenuItem::cmd("Remove item(s)", "Del", C::PlRemoveSelected),
+            MenuItem::cmd("Crop item(s)", "Ctrl+Del", C::PlCropSelected),
+            MenuItem::sep(),
+            MenuItem::cmd("View file info…", "Alt+3", C::FileInfo),
+            MenuItem::cmd("Playlist entry…", "Ctrl+E", C::EditPlaylistEntry),
+            MenuItem::sep(),
+            MenuItem::sub("Sort", self.sort_menu()),
+        ]
+    }
+
+    pub fn sort_menu(&self) -> Vec<MenuItem> {
+        use Command as C;
+        vec![
+            MenuItem::cmd("Sort list by title", "Ctrl+Shift+1", C::SortByTitle),
+            MenuItem::cmd("Sort list by filename", "Ctrl+Shift+2", C::SortByFileName),
+            MenuItem::cmd("Sort list by path and filename", "Ctrl+Shift+3", C::SortByPath),
+            MenuItem::sep(),
+            MenuItem::cmd("Reverse list", "Ctrl+R", C::ReverseList),
+            MenuItem::cmd("Randomize list", "Ctrl+Shift+R", C::RandomizeList),
+        ]
+    }
+
+    // --- remote control --------------------------------------------------------
+
+    pub fn on_remote(&mut self, remotes: Vec<Remote>) -> String {
+        let mut reply = "ok".to_string();
+        for r in remotes {
+            match r {
+                Remote::Open(files) => self.add(files, AddMode::ReplaceAndPlay),
+                Remote::Add(files) => self.add(files, AddMode::Append),
+                Remote::Cmd(c) => self.exec(c),
+                Remote::SetVolumePercent(p) => self.set_volume((p as i32 * 255 + 50) / 100),
+                Remote::VolumeStep(d) => self.set_volume(self.settings().volume + d * 255 / 100),
+                Remote::SetPan(p) => self.set_balance(p),
+                Remote::PanStep(d) => self.set_balance(self.settings().balance + d * 127 / 100),
+                Remote::Shuffle(v) => {
+                    let v = v.unwrap_or(!self.settings().shuffle);
+                    self.settings_mut().shuffle = v;
+                    self.update_next();
+                }
+                Remote::Repeat(v) => {
+                    let v = v.unwrap_or(!self.settings().repeat);
+                    self.settings_mut().repeat = v;
+                    self.update_next();
+                }
+                Remote::Clear => self.exec(Command::ClearPlaylist),
+                Remote::Show => self.ui.push(UiReq::Raise),
+                Remote::Quit => self.exec(Command::Exit),
+                Remote::Status => reply = self.status_json(),
+            }
+        }
+        reply
+    }
+
+    pub fn status_json(&self) -> String {
+        fn esc(s: &str) -> String {
+            let mut o = String::new();
+            for c in s.chars() {
+                match c {
+                    '"' => o.push_str("\\\""),
+                    '\\' => o.push_str("\\\\"),
+                    c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => o.push(c),
+                }
+            }
+            o
+        }
+        let sh = self.engine.shared();
+        let state = match sh.state() {
+            PlayState::Playing => "playing",
+            PlayState::Paused => "paused",
+            PlayState::Stopped => "stopped",
+        };
+        let s = self.settings();
+        let cur = self.playlist.current_entry();
+        format!(
+            "{{\"state\":\"{state}\",\"position_ms\":{},\"length_ms\":{},\"volume\":{},\"balance\":{},\"shuffle\":{},\"repeat\":{},\"index\":{},\"count\":{},\"title\":\"{}\",\"location\":\"{}\"}}",
+            sh.position_ms(),
+            sh.length_ms().map(|l| l.to_string()).unwrap_or_else(|| "null".into()),
+            s.volume,
+            s.balance,
+            s.shuffle,
+            s.repeat,
+            self.playlist.current().map(|i| i.to_string()).unwrap_or_else(|| "null".into()),
+            self.playlist.len(),
+            esc(&cur.map(|e| e.display.clone()).unwrap_or_default()),
+            esc(&cur.map(|e| e.location.clone()).unwrap_or_default()),
+        )
+    }
+}

@@ -1,1 +1,108 @@
-fn main() {}
+//! Linamp: a Winamp-style skinnable audio player for Linux.
+
+mod app;
+mod cli;
+mod dialogs;
+mod font;
+mod ipc;
+mod menu;
+mod model;
+mod render;
+mod shape;
+mod ui;
+mod ui_eq;
+mod ui_main;
+mod ui_pl;
+mod vis;
+
+use cli::Remote;
+use linamp_core::config::{Config, Paths};
+use model::{AppEvent, Model};
+use winit::event_loop::EventLoop;
+
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let opts = match cli::parse(std::env::args().skip(1)) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("linamp: {e}");
+            std::process::exit(2);
+        }
+    };
+    if opts.help {
+        print!("{}", cli::HELP);
+        return;
+    }
+    if opts.version {
+        println!("linamp {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    let class = opts.instance_class.clone().unwrap_or_else(|| "default".into());
+    let socket = ipc::socket_path(&class);
+
+    // Forward to a running instance unless /NEW.
+    if !opts.new_instance {
+        let mut remotes = opts.remotes.clone();
+        if opts.kill {
+            remotes = vec![Remote::Quit];
+        }
+        let forwarded = if remotes.is_empty() { vec![Remote::Show] } else { remotes };
+        match ipc::send(&socket, &forwarded) {
+            Ok(reply) => {
+                if forwarded.contains(&Remote::Status) {
+                    println!("{reply}");
+                }
+                return;
+            }
+            Err(_) if opts.kill || forwarded.iter().all(|r| matches!(r, Remote::Quit | Remote::Status)) => {
+                eprintln!("linamp: no running instance");
+                std::process::exit(1);
+            }
+            Err(_) => {}
+        }
+    }
+
+    if let Err(e) = linamp_audio::alsa::available() {
+        log::error!("{e} — audio output will not work");
+    }
+    let paths = Paths::resolve(opts.ini_dir.clone());
+    let ini = opts.config_file.clone().unwrap_or_else(|| paths.ini_file());
+    let config = Config::load(ini);
+    if opts.del_m3u {
+        let _ = std::fs::remove_file(paths.playlist_file());
+    }
+
+    let event_loop = match EventLoop::<AppEvent>::with_user_event().build() {
+        Ok(el) => el,
+        Err(e) => {
+            eprintln!("linamp: cannot open a display: {e}");
+            std::process::exit(1);
+        }
+    };
+    let proxy = event_loop.create_proxy();
+    let mut model = Model::new(paths, config, proxy.clone());
+    model.load_session();
+
+    let server_proxy = proxy.clone();
+    let socket_for_server = if opts.new_instance && opts.instance_class.is_none() {
+        ipc::socket_path(&format!("new-{}", std::process::id()))
+    } else {
+        socket.clone()
+    };
+    if let Err(e) = ipc::serve(socket_for_server.clone(), move |req| {
+        let _ = server_proxy.send_event(AppEvent::Remote(req));
+    }) {
+        log::warn!("cannot create control socket {}: {e}", socket_for_server.display());
+    }
+
+    let reply = model.on_remote(opts.remotes.clone());
+    if opts.remotes.contains(&Remote::Status) {
+        println!("{reply}");
+    }
+
+    let mut app = app::App::new(model, opts.start_minimized);
+    if let Err(e) = event_loop.run_app(&mut app) {
+        log::error!("event loop: {e}");
+    }
+    let _ = std::fs::remove_file(&socket_for_server);
+}

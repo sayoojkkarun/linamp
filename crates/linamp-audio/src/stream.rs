@@ -63,8 +63,11 @@ pub fn parse_stream_title(meta: &[u8]) -> Option<String> {
     (!title.is_empty()).then(|| title.to_string())
 }
 
+/// An opened stream: media source, format hint, headers and the title slot.
+pub type Opened = (Box<dyn MediaSource>, Option<&'static str>, StreamHeaders, TitleSlot);
+
 /// Connects to `url`. Returns a media source, an extension hint and headers.
-pub fn open(url: &str, proxy: &str) -> Result<(Box<dyn MediaSource>, Option<&'static str>, StreamHeaders, TitleSlot), String> {
+pub fn open(url: &str, proxy: &str) -> Result<Opened, String> {
     let mut builder = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(10))
         .timeout_read(std::time::Duration::from_secs(20))

@@ -374,7 +374,7 @@ fn call(name: &str, args: &[Vec<Node>], f: &dyn Fields) -> Val {
             let fill = if n >= 3 { arg(2).text.chars().next().unwrap_or(' ') } else { ' ' };
             let mut s = if name == "padcut" { chars_left(&v.text, width) } else { v.text.clone() };
             let missing = width.saturating_sub(s.chars().count());
-            let padding: String = std::iter::repeat(fill).take(missing).collect();
+            let padding: String = std::iter::repeat_n(fill, missing).collect();
             if name == "lpad" {
                 s = padding + &s;
             } else {
