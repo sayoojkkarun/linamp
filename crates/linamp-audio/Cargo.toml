@@ -1,6 +1,18 @@
 [package]
 name = "linamp-audio"
+description = "Decoding, DSP and ALSA output for Linamp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 
 [dependencies]
+linamp-core.workspace = true
+symphonia.workspace = true
+libloading.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+ureq.workspace = true
+log.workspace = true
+
+[dev-dependencies]
