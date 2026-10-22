@@ -1,6 +1,13 @@
 [package]
 name = "linamp-skin"
+description = "Classic (.wsz) skin loading and Linamp's own default skin"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 
 [dependencies]
+linamp-core.workspace = true
+image.workspace = true
+zip.workspace = true
+log.workspace = true
