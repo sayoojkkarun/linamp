@@ -311,7 +311,7 @@ impl AudioSource for PipeSource {
         self.produced = true;
         self.carry.extend_from_slice(&self.bytes[..n]);
         let whole = self.carry.len() / 8 * 8;
-        out.extend(self.carry[..whole].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+        out.extend(self.carry[..whole].as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
         self.carry.drain(..whole);
         Ok(Status::Data)
     }

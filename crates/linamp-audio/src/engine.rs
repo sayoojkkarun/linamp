@@ -108,7 +108,7 @@ impl VisRing {
 
     fn push_stereo(&mut self, samples: &[f32], start_frame: u64) {
         self.written = start_frame;
-        for f in samples.chunks_exact(2) {
+        for f in samples.as_chunks::<2>().0 {
             self.buf[(self.written as usize) & (VIS_LEN - 1)] = (f[0] + f[1]) * 0.5;
             self.written += 1;
         }
@@ -606,7 +606,7 @@ impl Worker {
         let vol = volume_gain(self.volume);
         let (gl, gr) = balance_gains(self.balance);
         let mut fade_done = false;
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let mut g = vol;
             if let Some((left, total)) = &mut self.fade {
                 g *= *left as f32 / *total as f32;
