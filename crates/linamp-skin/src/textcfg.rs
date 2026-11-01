@@ -88,7 +88,7 @@ fn parse_section(ini: &Ini, name: &str) -> Option<Vec<Vec<(i32, i32)>>> {
     let counts = ints(ini.get(name, "NumPoints")?);
     let coords = ints(ini.get(name, "PointList")?);
     let mut polys = Vec::new();
-    let mut it = coords.chunks_exact(2).map(|c| (c[0], c[1]));
+    let mut it = coords.as_chunks::<2>().0.iter().map(|&[x, y]| (x, y));
     for n in counts {
         let poly: Vec<(i32, i32)> = it.by_ref().take(n.max(0) as usize).collect();
         if poly.len() >= 3 {
@@ -124,9 +124,9 @@ pub fn region_mask(polys: &[Vec<(i32, i32)>], w: i32, h: i32) -> Vec<bool> {
                 }
             }
             xs.sort_by(f32::total_cmp);
-            for pair in xs.chunks_exact(2) {
-                let x0 = (pair[0] - 0.5).ceil().max(0.0) as i32;
-                let x1 = ((pair[1] - 0.5).ceil() as i32).min(w);
+            for [a, b] in xs.as_chunks::<2>().0 {
+                let x0 = (a - 0.5).ceil().max(0.0) as i32;
+                let x1 = ((b - 0.5).ceil() as i32).min(w);
                 for x in x0..x1 {
                     mask[(y * w + x) as usize] = true;
                 }

@@ -913,7 +913,7 @@ impl App {
 
     /// Executes window-system requests queued by the model.
     fn after_model(&mut self, el: &ActiveEventLoop) {
-        let reqs: Vec<UiReq> = self.model.ui.drain(..).collect();
+        let reqs: Vec<UiReq> = std::mem::take(&mut self.model.ui);
         for r in reqs {
             match r {
                 UiReq::Dialog(kind, req) => {

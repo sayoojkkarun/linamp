@@ -121,8 +121,8 @@ impl Bitmap {
                 }
             }
             xs.sort_by(f32::total_cmp);
-            for pair in xs.chunks_exact(2) {
-                let (x0, x1) = (pair[0].round() as i32, pair[1].round() as i32);
+            for [a, b] in xs.as_chunks::<2>().0 {
+                let (x0, x1) = (a.round() as i32, b.round() as i32);
                 self.fill(x0, y, x1 - x0, 1, c);
             }
         }
