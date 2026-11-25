@@ -285,18 +285,44 @@ impl Config {
     }
 }
 
+fn staged_file(path: &Path, data: &[u8]) -> io::Result<tempfile::NamedTempFile> {
+    use std::io::Write;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(data)?;
+    Ok(tmp)
+}
+
 pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("tmp~");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)
+    staged_file(path, data)?.persist(path)?;
+    Ok(())
+}
+
+/// Publish the complete file only if the destination is still unused.
+pub fn write_atomic_new(path: &Path, data: &[u8]) -> io::Result<()> {
+    staged_file(path, data)?.persist_noclobber(path)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_is_unique_for_settings_and_playlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("linamp.ini");
+        let list = dir.path().join("linamp.m3u8");
+        let a = staged_file(&ini, b"settings").unwrap();
+        let b = staged_file(&list, b"playlist").unwrap();
+        assert_ne!(a.path(), b.path());
+        b.persist(&list).unwrap();
+        a.persist(&ini).unwrap();
+        assert_eq!(std::fs::read(list).unwrap(), b"playlist");
+        assert_eq!(write_atomic_new(&ini, b"replacement").unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(ini).unwrap(), b"settings");
+    }
 
     #[test]
     fn defaults_and_round_trip() {

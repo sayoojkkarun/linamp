@@ -4,6 +4,7 @@
 use crate::atf::Format;
 use crate::meta::{TrackFields, TrackMeta};
 use crate::text::natural_cmp;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -85,6 +86,7 @@ pub enum SortKey {
 #[derive(Debug, Default)]
 pub struct Playlist {
     entries: Vec<Entry>,
+    indices: HashMap<u64, usize>,
     /// Index of the "current" (playing or to-be-played) entry.
     current: Option<usize>,
     /// Keyboard cursor / focus row.
@@ -132,10 +134,16 @@ impl Playlist {
         self.current.and_then(|i| self.entries.get(i))
     }
     pub fn index_of_id(&self, id: u64) -> Option<usize> {
-        self.entries.iter().position(|e| e.id == id)
+        // Entry is a public, mutable API. Recover if a caller replaced an entire entry.
+        self.indices
+            .get(&id)
+            .copied()
+            .filter(|&i| self.entries[i].id == id)
+            .or_else(|| self.entries.iter().position(|entry| entry.id == id))
     }
     pub fn find_mut_by_id(&mut self, id: u64) -> Option<&mut Entry> {
-        self.entries.iter_mut().find(|e| e.id == id)
+        let index = self.index_of_id(id)?;
+        self.entries.get_mut(index)
     }
 
     pub fn set_current(&mut self, idx: Option<usize>) {
@@ -156,13 +164,22 @@ impl Playlist {
         self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
     }
 
+    fn reindex(&mut self) {
+        self.indices.clear();
+        for (idx, e) in self.entries.iter().enumerate() {
+            self.indices.entry(e.id).or_insert(idx);
+        }
+    }
+
     pub fn push(&mut self, e: Entry) {
-        self.entries.push(e);
-        self.touch();
+        self.extend([e]);
     }
 
     pub fn extend(&mut self, es: impl IntoIterator<Item = Entry>) {
-        self.entries.extend(es);
+        for e in es {
+            self.indices.entry(e.id).or_insert(self.entries.len());
+            self.entries.push(e);
+        }
         self.touch();
     }
 
@@ -171,6 +188,7 @@ impl Playlist {
         let at = at.min(self.entries.len());
         let n = es.len();
         self.entries.splice(at..at, es);
+        self.reindex();
         if let Some(c) = self.current.as_mut() {
             if *c >= at {
                 *c += n;
@@ -181,15 +199,17 @@ impl Playlist {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.indices.clear();
         self.current = None;
         self.cursor = 0;
         self.shuffle = ShuffleState::default();
         self.touch();
     }
 
-    fn retain_by(&mut self, keep: impl Fn(&Entry) -> bool) {
+    pub fn retain_by(&mut self, keep: impl Fn(&Entry) -> bool) {
         let current_id = self.current_entry().map(|e| e.id);
         self.entries.retain(|e| keep(e));
+        self.reindex();
         self.current = current_id.and_then(|id| self.index_of_id(id));
         self.touch();
     }
@@ -260,6 +280,7 @@ impl Playlist {
         }
         let mut rest_iter = rest.drain(..);
         self.entries = slots.into_iter().map(|s| s.unwrap_or_else(|| rest_iter.next().expect("slot count matches"))).collect();
+        self.reindex();
         self.current = current_id.and_then(|id| self.index_of_id(id));
         self.cursor = (self.cursor as isize + delta).clamp(0, self.entries.len() as isize - 1) as usize;
         self.touch();
@@ -271,6 +292,7 @@ impl Playlist {
     fn reorder(&mut self, f: impl FnOnce(&mut Vec<Entry>)) {
         let current_id = self.current_entry().map(|e| e.id);
         f(&mut self.entries);
+        self.reindex();
         self.current = current_id.and_then(|id| self.index_of_id(id));
         self.touch();
     }

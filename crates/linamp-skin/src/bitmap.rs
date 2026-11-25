@@ -36,7 +36,15 @@ impl Bitmap {
 
     /// Decodes BMP/PNG/GIF/JPEG (format sniffed from the bytes).
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?.to_rgb8();
+        // Classic sheets are at most 344 by 433 in the reference skin. With 15
+        // named sheets, this bound also caps retained pixels across the skin.
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(1024);
+        limits.max_image_height = Some(1024);
+        limits.max_alloc = Some(16 << 20);
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| e.to_string())?;
+        reader.limits(limits);
+        let img = reader.decode().map_err(|e| e.to_string())?.into_rgb8();
         let (w, h) = img.dimensions();
         let px = img.pixels().map(|p| rgb(p[0], p[1], p[2])).collect();
         Ok(Self { w: w as i32, h: h as i32, px })
@@ -121,7 +129,7 @@ impl Bitmap {
                 }
             }
             xs.sort_by(f32::total_cmp);
-            for pair in xs.chunks_exact(2) {
+            for pair in xs.as_chunks::<2>().0 {
                 let (x0, x1) = (pair[0].round() as i32, pair[1].round() as i32);
                 self.fill(x0, y, x1 - x0, 1, c);
             }

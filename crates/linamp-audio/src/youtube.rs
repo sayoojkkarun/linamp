@@ -8,10 +8,12 @@ use crate::decoder::{AudioSource, Status, StreamInfo};
 use linamp_core::meta::TrackMeta;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
-use std::io::Read;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::io::{self, Read};
+use std::os::fd::AsFd;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use url::Url;
 
 const RATE: u32 = 48_000;
 const CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -43,32 +45,31 @@ pub fn configure(c: Config) {
     *config().write() = c;
 }
 
-fn host_of(url: &str) -> Option<String> {
-    let rest = url.split_once("://")?.1;
-    let host = rest.split(['/', '?', '#']).next()?;
-    let host = host.rsplit('@').next()?.split(':').next()?;
-    Some(host.to_ascii_lowercase())
-}
-
-/// True for youtube.com / youtu.be / music.youtube.com / youtube-nocookie links.
-pub fn is_youtube(url: &str) -> bool {
-    let Some(host) = host_of(url) else { return false };
-    let host = host.strip_prefix("www.").unwrap_or(&host);
-    matches!(host, "youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtu.be" | "youtube-nocookie.com")
-}
-
-/// True when the URL names one video (as opposed to a playlist or channel).
-pub fn is_single_video(url: &str) -> bool {
-    let Some(host) = host_of(url) else { return false };
-    let path = url.split_once("://").map(|(_, r)| r).and_then(|r| r.find('/').map(|i| &r[i..])).unwrap_or("");
-    if host.ends_with("youtu.be") {
-        return path.len() > 1;
+fn youtube_url(input: &str) -> Option<Url> {
+    let url = Url::parse(input).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
     }
-    let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let host = url.host_str()?;
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    matches!(host, "youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtu.be" | "youtube-nocookie.com").then_some(url)
+}
+
+/// True for recognized HTTP(S) YouTube links.
+pub fn is_youtube(input: &str) -> bool {
+    youtube_url(input).is_some()
+}
+
+pub fn is_single_video(input: &str) -> bool {
+    let Some(url) = youtube_url(input) else { return false };
+    if matches!(url.host_str(), Some("youtu.be" | "www.youtu.be")) {
+        return url.path().len() > 1;
+    }
+    let path = url.path();
     path.starts_with("/shorts/")
         || path.starts_with("/live/")
         || path.starts_with("/embed/")
-        || query.split('&').any(|kv| kv.starts_with("v="))
+        || url.query_pairs().any(|(key, _)| key == "v")
 }
 
 #[derive(Debug, Clone)]
@@ -84,27 +85,115 @@ fn cache() -> &'static Mutex<HashMap<String, (Instant, Resolved)>> {
     C.get_or_init(Default::default)
 }
 
-fn run_ytdlp(args: &[&str]) -> Result<serde_json::Value, String> {
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_DIAGNOSTIC: usize = 8192;
+const MAX_JSON: usize = 16 << 20;
+
+enum PipeRead {
+    Data(usize),
+    Pending,
+    Done(ExitStatus),
+}
+
+/// Read each pipe without blocking so either helper can be stopped while waiting for data.
+struct Helper {
+    child: Child,
+    diagnostic: Vec<u8>,
+}
+
+fn nonblocking(pipe: &impl AsFd) -> io::Result<()> {
+    use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+    Ok(fcntl_setfl(pipe, fcntl_getfl(pipe)? | OFlags::NONBLOCK)?)
+}
+
+impl Helper {
+    fn spawn(cmd: &mut Command) -> io::Result<Self> {
+        let child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let helper = Self { child, diagnostic: Vec::new() };
+        nonblocking(helper.child.stdout.as_ref().expect("piped stdout"))?;
+        nonblocking(helper.child.stderr.as_ref().expect("piped stderr"))?;
+        Ok(helper)
+    }
+
+    fn read(&mut self, data: &mut [u8]) -> io::Result<PipeRead> {
+        let mut errors = [0; MAX_DIAGNOSTIC];
+        if let Some(stderr) = self.child.stderr.as_mut() {
+            match stderr.read(&mut errors) {
+                Ok(0) => self.child.stderr = None,
+                Ok(n) => {
+                    let excess = (self.diagnostic.len() + n).saturating_sub(MAX_DIAGNOSTIC);
+                    self.diagnostic.drain(..excess);
+                    self.diagnostic.extend_from_slice(&errors[..n]);
+                }
+                Err(e) if matches!(e.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(stdout) = self.child.stdout.as_mut() {
+            match stdout.read(data) {
+                Ok(0) => self.child.stdout = None,
+                Ok(n) => return Ok(PipeRead::Data(n)),
+                Err(e) if matches!(e.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if self.child.stdout.is_none() && self.child.stderr.is_none() {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(PipeRead::Done(status));
+            }
+        }
+        Ok(PipeRead::Pending)
+    }
+
+    fn error_message(&self, name: &str, status: ExitStatus) -> String {
+        let text = String::from_utf8_lossy(&self.diagnostic);
+        match text.lines().last().map(str::trim) {
+            Some(line) if !line.is_empty() => format!("{name}: {line}"),
+            _ => format!("{name} exited with {status}"),
+        }
+    }
+}
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn run_ytdlp(args: &[&str], input: &str, cancelled: &dyn Fn() -> bool) -> Result<serde_json::Value, String> {
+    let url = youtube_url(input).ok_or("invalid YouTube URL")?;
     let cfg = config().read().clone();
     let mut cmd = Command::new(&cfg.ytdlp);
     cmd.args(["--no-warnings", "--no-progress"]);
     if !cfg.proxy.trim().is_empty() {
         cmd.args(["--proxy", &format!("http://{}", cfg.proxy.trim())]);
     }
-    cmd.args(args).stdin(Stdio::null());
-    let out = cmd.output().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!("{} not found: install yt-dlp to play YouTube links", cfg.ytdlp)
-        } else {
-            format!("cannot run {}: {e}", cfg.ytdlp)
+    cmd.args(args).arg("--").arg(url.as_str());
+    let mut helper = Helper::spawn(&mut cmd).map_err(|e| format!("cannot run {}: {e}", cfg.ytdlp))?;
+    let mut output = Vec::new();
+    let mut buffer = [0; 16_384];
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if cancelled() {
+            return Err("YouTube lookup cancelled".into());
         }
-    })?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let line = err.lines().rev().find(|l| l.contains("ERROR")).or_else(|| err.lines().last()).unwrap_or("yt-dlp failed");
-        return Err(line.trim().trim_start_matches("ERROR: ").to_string());
+        if Instant::now() >= deadline {
+            return Err("YouTube lookup timed out".into());
+        }
+        match helper.read(&mut buffer).map_err(|e| format!("yt-dlp: {e}"))? {
+            PipeRead::Data(n) => {
+                if output.len() + n > MAX_JSON {
+                    return Err("yt-dlp response too large".into());
+                }
+                output.extend_from_slice(&buffer[..n]);
+            }
+            PipeRead::Pending => std::thread::sleep(POLL_INTERVAL),
+            PipeRead::Done(status) if status.success() => break,
+            PipeRead::Done(status) => return Err(helper.error_message("yt-dlp", status)),
+        }
     }
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("yt-dlp returned bad JSON: {e}"))
+    serde_json::from_slice(&output).map_err(|e| format!("yt-dlp returned bad JSON: {e}"))
 }
 
 fn str_field(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -130,13 +219,17 @@ fn meta_from_json(v: &serde_json::Value) -> TrackMeta {
 
 /// Resolves a video URL to its audio stream (cached for an hour).
 pub fn resolve(url: &str) -> Result<Resolved, String> {
+    resolve_with_cancel(url, &|| false)
+}
+
+fn resolve_with_cancel(url: &str, cancelled: &dyn Fn() -> bool) -> Result<Resolved, String> {
     if let Some((at, r)) = cache().lock().get(url) {
         if at.elapsed() < CACHE_TTL {
             return Ok(r.clone());
         }
     }
     let format = config().read().format.clone();
-    let v = run_ytdlp(&["-j", "--no-playlist", "-f", &format, url])?;
+    let v = run_ytdlp(&["-j", "--no-playlist", "-f", &format], url, cancelled)?;
     let stream_url = str_field(&v, &["url"]).ok_or("yt-dlp found no audio stream")?;
     let headers = v
         .get("http_headers")
@@ -167,7 +260,7 @@ pub struct ListItem {
 /// Lists the videos of a playlist or channel URL without resolving them.
 pub fn list(url: &str) -> Result<Vec<ListItem>, String> {
     let end = MAX_PLAYLIST.to_string();
-    let v = run_ytdlp(&["-J", "--flat-playlist", "--playlist-end", &end, url])?;
+    let v = run_ytdlp(&["-J", "--flat-playlist", "--playlist-end", &end], url, &|| false)?;
     Ok(parse_listing(&v))
 }
 
@@ -197,8 +290,7 @@ fn parse_listing(v: &serde_json::Value) -> Vec<ListItem> {
 /// Decodes a resolved stream through an `ffmpeg` child process.
 pub struct PipeSource {
     resolved: Resolved,
-    child: Option<Child>,
-    stdout: Option<ChildStdout>,
+    helper: Option<Helper>,
     info: StreamInfo,
     bytes: Vec<u8>,
     /// Bytes carried over between reads (partial samples).
@@ -208,7 +300,11 @@ pub struct PipeSource {
 
 impl PipeSource {
     pub fn open(url: &str, start_ms: u64) -> Result<(PipeSource, TrackMeta), String> {
-        let resolved = resolve(url)?;
+        Self::open_with_cancel(url, start_ms, &|| false)
+    }
+
+    pub(crate) fn open_with_cancel(url: &str, start_ms: u64, cancelled: &dyn Fn() -> bool) -> Result<(PipeSource, TrackMeta), String> {
+        let resolved = resolve_with_cancel(url, cancelled)?;
         let meta = resolved.meta.clone();
         let info = StreamInfo {
             sample_rate: RATE,
@@ -218,13 +314,12 @@ impl PipeSource {
             codec: meta.codec.clone().unwrap_or_else(|| "YOUTUBE".into()),
             seekable: !resolved.is_live,
         };
-        let mut src = PipeSource { resolved, child: None, stdout: None, info, bytes: vec![0; 16384], carry: Vec::new(), produced: false };
+        let mut src = PipeSource { resolved, helper: None, info, bytes: vec![0; 16384], carry: Vec::new(), produced: false };
         src.spawn(start_ms)?;
         Ok((src, meta))
     }
 
     fn spawn(&mut self, start_ms: u64) -> Result<(), String> {
-        self.kill();
         let cfg = config().read().clone();
         let mut cmd = Command::new(&cfg.ffmpeg);
         cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
@@ -247,42 +342,17 @@ impl PipeSource {
             cmd.args(["-ss", &format!("{}.{:03}", start_ms / 1000, start_ms % 1000)]);
         }
         cmd.args(["-i", &self.resolved.stream_url, "-vn", "-f", "f32le", "-ac", "2", "-ar", &RATE.to_string(), "pipe:1"]);
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| {
+        let helper = Helper::spawn(&mut cmd).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 format!("{} not found: install ffmpeg to play YouTube links", cfg.ffmpeg)
             } else {
                 format!("cannot run {}: {e}", cfg.ffmpeg)
             }
         })?;
-        self.stdout = child.stdout.take();
-        self.child = Some(child);
+        self.helper = Some(helper);
         self.carry.clear();
         self.produced = false;
         Ok(())
-    }
-
-    fn kill(&mut self) {
-        self.stdout = None;
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-
-    /// The child's error output once it has exited.
-    fn failure(&mut self) -> Option<String> {
-        let mut child = self.child.take()?;
-        let status = child.wait().ok()?;
-        if status.success() {
-            return None;
-        }
-        let mut err = String::new();
-        if let Some(mut e) = child.stderr.take() {
-            let _ = e.read_to_string(&mut err);
-        }
-        let line = err.lines().last().unwrap_or("").trim().to_string();
-        Some(if line.is_empty() { format!("ffmpeg exited with {status}") } else { format!("ffmpeg: {line}") })
     }
 }
 
@@ -292,26 +362,29 @@ impl AudioSource for PipeSource {
     }
 
     fn next(&mut self, out: &mut Vec<f32>) -> Result<Status, String> {
-        let Some(stdout) = self.stdout.as_mut() else { return Ok(Status::Eof) };
-        let n = match stdout.read(&mut self.bytes) {
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Ok(Status::Data),
-            Err(e) => return Err(format!("ffmpeg pipe: {e}")),
-        };
-        if n == 0 {
-            self.stdout = None;
-            if let Some(err) = self.failure() {
-                if !self.produced {
-                    return Err(err);
-                }
-                log::warn!("{err}");
+        let Some(helper) = self.helper.as_mut() else { return Ok(Status::Eof) };
+        let n = match helper.read(&mut self.bytes).map_err(|e| format!("ffmpeg pipe: {e}"))? {
+            PipeRead::Data(n) => n,
+            PipeRead::Pending => {
+                std::thread::sleep(POLL_INTERVAL);
+                return Ok(Status::Data);
             }
-            return Ok(Status::Eof);
-        }
+            PipeRead::Done(status) => {
+                let error = (!status.success()).then(|| helper.error_message("ffmpeg", status));
+                self.helper = None;
+                if let Some(error) = error {
+                    if !self.produced {
+                        return Err(error);
+                    }
+                    log::warn!("{error}");
+                }
+                return Ok(Status::Eof);
+            }
+        };
         self.produced = true;
         self.carry.extend_from_slice(&self.bytes[..n]);
         let whole = self.carry.len() / 8 * 8;
-        out.extend(self.carry[..whole].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+        out.extend(self.carry[..whole].as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes));
         self.carry.drain(..whole);
         Ok(Status::Data)
     }
@@ -326,15 +399,33 @@ impl AudioSource for PipeSource {
     }
 }
 
-impl Drop for PipeSource {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_drains_diagnostics_while_waiting_for_output() {
+        // Emit more than a pipe buffer before stdout becomes ready.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 262144 /dev/zero >&2 && printf music"]);
+        let mut helper = Helper::spawn(&mut cmd).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut audio = Vec::new();
+        let mut block = [0; 16];
+        loop {
+            assert!(Instant::now() < deadline);
+            match helper.read(&mut block).unwrap() {
+                PipeRead::Data(n) => audio.extend_from_slice(&block[..n]),
+                PipeRead::Pending => std::thread::sleep(Duration::from_millis(1)),
+                PipeRead::Done(status) => {
+                    assert!(status.success());
+                    break;
+                }
+            }
+        }
+        assert_eq!(audio, b"music");
+        assert_eq!(helper.diagnostic.len(), MAX_DIAGNOSTIC);
+    }
 
     #[test]
     fn detects_youtube_urls() {
@@ -348,9 +439,15 @@ mod tests {
         ] {
             assert!(is_youtube(u), "{u}");
         }
-        for u in
-            ["https://notyoutube.com/watch?v=a", "https://example.com/youtube.com", "/music/youtube.com.mp3", "http://radio:8000/stream"]
-        {
+        for u in [
+            "https://notyoutube.com/watch?v=a",
+            "https://example.com/youtube.com",
+            "/music/youtube.com.mp3",
+            "http://radio:8000/stream",
+            "ftp://youtube.com/video",
+            "https://youtube.com.example.com",
+            "youtube.com/watch",
+        ] {
             assert!(!is_youtube(u), "{u}");
         }
     }

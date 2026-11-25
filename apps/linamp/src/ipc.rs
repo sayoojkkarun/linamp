@@ -6,21 +6,48 @@
 
 use crate::cli::Remote;
 use linamp_core::Command;
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-pub fn socket_path(class: &str) -> PathBuf {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("linamp-{}", unsafe_uid())));
-    let safe: String = class.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-    dir.join("linamp").join(format!("{safe}.sock"))
+const IPC_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REQUEST: usize = 1 << 20;
+
+fn private_dir(path: &Path) -> io::Result<()> {
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        result => result?,
+    }
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_dir() || meta.uid() != rustix::process::geteuid().as_raw() || meta.mode() & 0o022 != 0 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unsafe Linamp runtime directory"));
+    }
+    if meta.mode() & 0o077 != 0 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
-fn unsafe_uid() -> String {
-    std::env::var("USER").unwrap_or_else(|_| "user".into())
+pub fn socket_path(class: &str) -> io::Result<PathBuf> {
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            let dir = std::env::temp_dir().join(format!("linamp-{}", rustix::process::geteuid().as_raw()));
+            private_dir(&dir)?;
+            dir
+        }
+    }
+    .join("linamp");
+    private_dir(&dir)?;
+    let safe: String = class.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    Ok(dir.join(format!("{safe}.sock")))
+}
+
+pub fn absent(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
 }
 
 fn escape(s: &str) -> String {
@@ -92,11 +119,24 @@ pub fn decode(line: &str) -> Option<Remote> {
     })
 }
 
-/// Sends commands to a running instance. Returns its reply, or `Err` if
-/// none is running.
-pub fn send(path: &PathBuf, remotes: &[Remote]) -> std::io::Result<String> {
-    let mut s = UnixStream::connect(path)?;
-    s.set_read_timeout(Some(Duration::from_secs(5)))?;
+/// Sends commands to a running instance and returns its reply.
+pub fn send(path: &Path, remotes: &[Remote]) -> io::Result<String> {
+    send_connected(UnixStream::connect(path)?, remotes)
+}
+
+pub fn forward_on_contention(path: &Path, remotes: &[Remote]) -> io::Result<String> {
+    let deadline = Instant::now() + IPC_TIMEOUT;
+    loop {
+        match UnixStream::connect(path) {
+            Err(e) if absent(&e) && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            result => return send_connected(result?, remotes),
+        }
+    }
+}
+
+fn send_connected(mut s: UnixStream, remotes: &[Remote]) -> io::Result<String> {
+    s.set_read_timeout(Some(IPC_TIMEOUT))?;
+    s.set_write_timeout(Some(IPC_TIMEOUT))?;
     let mut msg = String::new();
     for r in remotes {
         msg.push_str(&encode(r));
@@ -105,7 +145,9 @@ pub fn send(path: &PathBuf, remotes: &[Remote]) -> std::io::Result<String> {
     msg.push('\n');
     s.write_all(msg.as_bytes())?;
     let mut reply = String::new();
-    BufReader::new(s).read_line(&mut reply)?;
+    if BufReader::new(s.take(MAX_REQUEST as u64)).read_line(&mut reply)? == 0 || !reply.ends_with('\n') {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete reply from Linamp"));
+    }
     Ok(reply.trim_end().to_string())
 }
 
@@ -115,43 +157,89 @@ pub struct Request {
     pub reply: crossbeam_channel::Sender<String>,
 }
 
-/// Binds the socket (replacing a stale one) and serves on a thread.
-pub fn serve(path: PathBuf, deliver: impl Fn(Request) + Send + 'static) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    if path.exists() {
-        // Only reached when nothing answered on it: stale.
-        let _ = std::fs::remove_file(&path);
-    }
-    let listener = UnixListener::bind(&path)?;
-    std::thread::Builder::new().name("linamp-ipc".into()).spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            let mut reader = BufReader::new(match stream.try_clone() {
-                Ok(s) => s,
-                Err(_) => continue,
-            });
-            let mut remotes = Vec::new();
-            let mut line = String::new();
-            while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
-                let l = line.trim_end_matches('\n');
-                if l.is_empty() {
-                    break;
-                }
-                if let Some(r) = decode(l) {
-                    remotes.push(r);
-                }
-                line.clear();
-            }
-            let (tx, rx) = crossbeam_channel::bounded(1);
-            deliver(Request { remotes, reply: tx });
-            let reply = rx.recv_timeout(Duration::from_secs(4)).unwrap_or_else(|_| "ok".into());
-            let mut s = stream;
-            let _ = s.write_all(format!("{reply}\n").as_bytes());
+/// The lock file stays in place so all launchers lock the same inode.
+pub struct Endpoint {
+    path: PathBuf,
+    inode: (u64, u64),
+    listener: UnixListener,
+    _lock: File,
+}
+
+impl Endpoint {
+    pub fn bind(path: PathBuf) -> io::Result<Self> {
+        let lock = File::options().read(true).write(true).create(true).truncate(false).mode(0o600).open(path.with_extension("lock"))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Err(io::ErrorKind::AddrInUse.into()),
+            Err(fs::TryLockError::Error(e)) => return Err(e),
         }
-    })?;
-    Ok(())
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if !meta.file_type().is_socket() {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "control path is not a socket"));
+            }
+            // A running older version may own this socket without holding a lock.
+            match UnixStream::connect(&path) {
+                Ok(_) => return Err(io::ErrorKind::AddrInUse.into()),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => fs::remove_file(&path)?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let listener = UnixListener::bind(&path)?;
+        let meta = fs::symlink_metadata(&path)?;
+        Ok(Self { path, inode: (meta.dev(), meta.ino()), listener, _lock: lock })
+    }
+
+    pub fn serve(&self, deliver: impl Fn(Request) + Send + 'static) -> io::Result<()> {
+        let listener = self.listener.try_clone()?;
+        std::thread::Builder::new().name("linamp-ipc".into()).spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let Ok(remotes) = read_request(&mut stream) else { continue };
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                deliver(Request { remotes, reply: tx });
+                if let Ok(reply) = rx.recv_timeout(IPC_TIMEOUT) {
+                    let _ = stream.set_write_timeout(Some(IPC_TIMEOUT));
+                    let _ = writeln!(stream, "{reply}");
+                }
+            }
+        })?;
+        Ok(())
+    }
+}
+
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        if fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.inode) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn read_request(stream: &mut UnixStream) -> io::Result<Vec<Remote>> {
+    let mut data = Vec::new();
+    let mut buf = [0; 8192];
+    let deadline = Instant::now() + IPC_TIMEOUT;
+    while data.len() < MAX_REQUEST {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        let start = data.len().saturating_sub(1);
+        data.extend_from_slice(&buf[..n]);
+        if data.len() > MAX_REQUEST {
+            break;
+        }
+        if let Some(end) = data[start..].windows(2).position(|w| w == b"\n\n") {
+            let msg = std::str::from_utf8(&data[..start + end]).map_err(io::Error::other)?;
+            return Ok(msg.lines().filter_map(decode).collect());
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidData, "control request exceeds size limit"))
 }
 
 #[cfg(test)]
@@ -189,14 +277,34 @@ mod tests {
     }
 
     #[test]
+    fn owner_cleanup_preserves_replacement_socket() {
+        let path = std::env::temp_dir().join(format!("linamp-replaced-{}.sock", std::process::id()));
+        let owner = Endpoint::bind(path.clone()).unwrap();
+        fs::remove_file(&path).unwrap();
+        let replacement = UnixListener::bind(&path).unwrap();
+        drop(owner);
+        assert!(UnixStream::connect(&path).is_ok());
+        drop(replacement);
+        // Recover the stale socket and release it on exit.
+        drop(Endpoint::bind(path.clone()).unwrap());
+        assert!(!path.exists());
+        fs::remove_file(path.with_extension("lock")).unwrap();
+    }
+
+    #[test]
     fn socket_round_trip() {
         let path = std::env::temp_dir().join(format!("linamp-test-{}.sock", std::process::id()));
-        serve(path.clone(), |req| {
-            let _ = req.reply.send(format!("got {}", req.remotes.len()));
-        })
-        .unwrap();
+        let endpoint = Endpoint::bind(path.clone()).unwrap();
+        assert_eq!(Endpoint::bind(path.clone()).err().unwrap().kind(), io::ErrorKind::AddrInUse);
+        endpoint
+            .serve(|req| {
+                let _ = req.reply.send(format!("got {}", req.remotes.len()));
+            })
+            .unwrap();
         let reply = send(&path, &[Remote::Status, Remote::Cmd(Command::Play)]).unwrap();
         assert_eq!(reply, "got 2");
-        let _ = std::fs::remove_file(&path);
+        drop(endpoint);
+        assert!(!path.exists());
+        fs::remove_file(path.with_extension("lock")).unwrap();
     }
 }

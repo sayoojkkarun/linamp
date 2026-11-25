@@ -913,7 +913,7 @@ impl App {
 
     /// Executes window-system requests queued by the model.
     fn after_model(&mut self, el: &ActiveEventLoop) {
-        let reqs: Vec<UiReq> = self.model.ui.drain(..).collect();
+        let reqs: Vec<UiReq> = std::mem::take(&mut self.model.ui);
         for r in reqs {
             match r {
                 UiReq::Dialog(kind, req) => {
@@ -978,12 +978,10 @@ impl App {
         }
         if self.model.pl_dirty != self.seen_pl_dirty {
             self.seen_pl_dirty = self.model.pl_dirty;
-            if let Some(cur) = self.model.playlist.current() {
-                if self.model.status.playing_id.is_some() {
-                    let _ = cur;
-                }
+            // Winit coalesces redraw requests while metadata events are queued.
+            if let Some(w) = self.win(WinKind::Pl).filter(|w| w.visible) {
+                w.window.request_redraw();
             }
-            self.render(WinKind::Pl);
         }
     }
 
@@ -1106,8 +1104,8 @@ impl ApplicationHandler<AppEvent> for App {
                 self.render(WinKind::Main);
                 self.render(WinKind::Pl);
             }
-            AppEvent::Meta(id, m) => self.model.on_meta(id, m),
-            AppEvent::Expanded { items, mode } => self.model.on_expanded(items, mode),
+            AppEvent::Meta(id, location, m) => self.model.on_meta(id, &location, m),
+            AppEvent::Expanded { sequence, items, mode } => self.model.on_expanded(sequence, items, mode),
             AppEvent::Dialog(r) => self.model.on_dialog(r),
             AppEvent::Remote(req) => {
                 let reply = self.model.on_remote(req.remotes);

@@ -39,29 +39,43 @@ fn main() {
         return;
     }
     let class = opts.instance_class.clone().unwrap_or_else(|| "default".into());
-    let socket = ipc::socket_path(&class);
-
-    // Forward to a running instance unless /NEW.
-    if !opts.new_instance {
-        let mut remotes = opts.remotes.clone();
-        if opts.kill {
-            remotes = vec![Remote::Quit];
+    let socket_class =
+        if opts.new_instance && opts.instance_class.is_none() { format!("new-{}", std::process::id()) } else { class.clone() };
+    let fail = |err: std::io::Error| -> ! {
+        eprintln!("linamp: {err}");
+        std::process::exit(1);
+    };
+    let socket = ipc::socket_path(&socket_class).unwrap_or_else(|e| fail(e));
+    let mut forwarded = opts.remotes.clone();
+    if opts.kill {
+        forwarded = vec![Remote::Quit];
+    }
+    if forwarded.is_empty() {
+        forwarded.push(Remote::Show);
+    }
+    let print_reply = |reply: String| {
+        if forwarded.contains(&Remote::Status) {
+            println!("{reply}");
         }
-        let forwarded = if remotes.is_empty() { vec![Remote::Show] } else { remotes };
+    };
+    if !opts.new_instance {
         match ipc::send(&socket, &forwarded) {
-            Ok(reply) => {
-                if forwarded.contains(&Remote::Status) {
-                    println!("{reply}");
-                }
-                return;
-            }
-            Err(_) if opts.kill || forwarded.iter().all(|r| matches!(r, Remote::Quit | Remote::Status)) => {
+            Ok(reply) => return print_reply(reply),
+            Err(e) if !ipc::absent(&e) => fail(e),
+            Err(_) if forwarded.iter().all(|r| matches!(r, Remote::Quit | Remote::Status)) => {
                 eprintln!("linamp: no running instance");
                 std::process::exit(1);
             }
             Err(_) => {}
         }
     }
+    let endpoint = match ipc::Endpoint::bind(socket.clone()) {
+        Ok(endpoint) => endpoint,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && !opts.new_instance => {
+            return print_reply(ipc::forward_on_contention(&socket, &forwarded).unwrap_or_else(|e| fail(e)));
+        }
+        Err(e) => fail(e),
+    };
 
     if let Err(e) = linamp_audio::alsa::available() {
         log::error!("{e} — audio output will not work");
@@ -77,6 +91,7 @@ fn main() {
         Ok(el) => el,
         Err(e) => {
             eprintln!("linamp: cannot open a display: {e}");
+            drop(endpoint);
             std::process::exit(1);
         }
     };
@@ -85,15 +100,12 @@ fn main() {
     model.load_session();
 
     let server_proxy = proxy.clone();
-    let socket_for_server = if opts.new_instance && opts.instance_class.is_none() {
-        ipc::socket_path(&format!("new-{}", std::process::id()))
-    } else {
-        socket.clone()
-    };
-    if let Err(e) = ipc::serve(socket_for_server.clone(), move |req| {
+    if let Err(e) = endpoint.serve(move |req| {
         let _ = server_proxy.send_event(AppEvent::Remote(req));
     }) {
-        log::warn!("cannot create control socket {}: {e}", socket_for_server.display());
+        eprintln!("linamp: cannot start control socket: {e}");
+        drop(endpoint);
+        std::process::exit(1);
     }
 
     let reply = model.on_remote(opts.remotes.clone());
@@ -106,5 +118,5 @@ fn main() {
     if let Err(e) = event_loop.run_app(&mut app) {
         log::error!("event loop: {e}");
     }
-    let _ = std::fs::remove_file(&socket_for_server);
+    drop(endpoint);
 }

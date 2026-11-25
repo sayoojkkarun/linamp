@@ -107,14 +107,24 @@ pub fn open(url: &str, proxy: &str) -> Result<Opened, String> {
 
 /// Downloads a small text resource (remote playlists).
 pub fn fetch_text(url: &str, proxy: &str) -> Result<String, String> {
+    fetch_playlist(url, proxy).map(|(_, text)| text)
+}
+
+/// Return the final response URL so playlist entries resolve after redirects.
+pub fn fetch_playlist(url: &str, proxy: &str) -> Result<(String, String), String> {
     let mut builder = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15));
     if !proxy.trim().is_empty() {
         builder = builder.proxy(ureq::Proxy::new(proxy.trim()).map_err(|e| e.to_string())?);
     }
     let resp = builder.build().get(url).call().map_err(|e| e.to_string())?;
+    let base = resp.get_url().to_string();
+    const MAX_BYTES: u64 = 1 << 20;
     let mut bytes = Vec::new();
-    resp.into_reader().take(1 << 20).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-    Ok(linamp_core::text::decode_lossy(&bytes))
+    resp.into_reader().take(MAX_BYTES + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err("remote playlist exceeds 1 MiB".into());
+    }
+    Ok((base, linamp_core::text::decode_lossy(&bytes)))
 }
 
 #[cfg(test)]

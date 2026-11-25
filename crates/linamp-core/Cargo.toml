@@ -12,3 +12,5 @@ homepage.workspace = true
 [dependencies]
 fastrand.workspace = true
 log.workspace = true
+tempfile = "3"
+url = "2"

@@ -15,6 +15,7 @@ use linamp_core::plformats::{self, is_playlist, Item};
 use linamp_core::text::format_duration_ms;
 use linamp_core::{is_audio_file, Command};
 use linamp_skin::Skin;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,8 +25,8 @@ use winit::event_loop::EventLoopProxy;
 #[derive(Debug)]
 pub enum AppEvent {
     Engine(EngineEvent),
-    Meta(u64, Result<TrackMeta, String>),
-    Expanded { items: Vec<Item>, mode: AddMode },
+    Meta(u64, String, Result<TrackMeta, String>),
+    Expanded { sequence: u64, items: Vec<Item>, mode: AddMode },
     Dialog(DialogResult),
     Remote(crate::ipc::Request),
 }
@@ -35,6 +36,42 @@ pub enum AddMode {
     ReplaceAndPlay,
     Append,
     Insert(usize),
+}
+
+/// Commits asynchronously expanded playlists in the order requested by the user.
+#[derive(Default)]
+struct Imports {
+    issued: u64,
+    next: u64,
+    ready: BTreeMap<u64, (AddMode, Vec<Item>)>,
+}
+
+impl Imports {
+    fn discard_pending(&mut self) {
+        self.ready.clear();
+        self.next = self.issued;
+    }
+
+    fn begin(&mut self, mode: AddMode) -> u64 {
+        if mode == AddMode::ReplaceAndPlay {
+            self.discard_pending();
+        }
+        let id = self.issued;
+        self.issued += 1;
+        id
+    }
+
+    fn complete(&mut self, id: u64, mode: AddMode, items: Vec<Item>) {
+        if id >= self.next {
+            self.ready.insert(id, (mode, items));
+        }
+    }
+
+    fn pop(&mut self) -> Option<(AddMode, Vec<Item>)> {
+        let ready = self.ready.remove(&self.next)?;
+        self.next += 1;
+        Some(ready)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -85,6 +122,7 @@ pub struct Model {
     pub quit: bool,
     proxy: EventLoopProxy<AppEvent>,
     meta_tx: crossbeam_channel::Sender<(u64, String)>,
+    imports: Imports,
     error_skips: usize,
     pub last_dir: Option<PathBuf>,
     /// Increments when anything visible in the playlist changes.
@@ -105,7 +143,7 @@ fn spawn_meta_workers(proxy: EventLoopProxy<AppEvent>) -> crossbeam_channel::Sen
         let _ = std::thread::Builder::new().name(format!("linamp-meta{i}")).spawn(move || {
             for (id, path) in rx {
                 let res = if youtube::is_youtube(&path) { youtube::read_meta(&path) } else { linamp_audio::read_meta(Path::new(&path)) };
-                if proxy.send_event(AppEvent::Meta(id, res)).is_err() {
+                if proxy.send_event(AppEvent::Meta(id, path, res)).is_err() {
                     return;
                 }
             }
@@ -131,12 +169,12 @@ fn expand(locations: Vec<String>, proxy_setting: &str) -> Vec<Item> {
         }
         if is_url(&loc) {
             if is_playlist(&loc) {
-                match linamp_audio::stream::fetch_text(&loc, proxy_setting) {
-                    Ok(text) => {
+                match linamp_audio::stream::fetch_playlist(&loc, proxy_setting) {
+                    Ok((base, text)) => {
                         let fmt = plformats::PlaylistFormat::from_path(Path::new(loc.split('?').next().unwrap_or(&loc)))
                             .or_else(|| plformats::sniff(&text))
                             .unwrap_or(plformats::PlaylistFormat::M3u);
-                        out.extend(plformats::parse(&text, fmt, None));
+                        out.extend(plformats::parse_remote(&text, fmt, &base));
                     }
                     Err(e) => log::warn!("cannot fetch {loc}: {e}"),
                 }
@@ -210,6 +248,7 @@ impl Model {
             quit: false,
             proxy,
             meta_tx,
+            imports: Imports::default(),
             error_skips: 0,
             last_dir: None,
             pl_dirty: 0,
@@ -296,13 +335,24 @@ impl Model {
         }
         let proxy = self.proxy.clone();
         let proxy_setting = self.settings().proxy.clone();
-        let _ = std::thread::Builder::new().name("linamp-expand".into()).spawn(move || {
+        let sequence = self.imports.begin(mode);
+        if let Err(e) = std::thread::Builder::new().name("linamp-expand".into()).spawn(move || {
             let items = expand(locations, &proxy_setting);
-            let _ = proxy.send_event(AppEvent::Expanded { items, mode });
-        });
+            let _ = proxy.send_event(AppEvent::Expanded { sequence, items, mode });
+        }) {
+            log::warn!("cannot start playlist import: {e}");
+            self.on_expanded(sequence, Vec::new(), mode);
+        }
     }
 
-    pub fn on_expanded(&mut self, items: Vec<Item>, mode: AddMode) {
+    pub fn on_expanded(&mut self, sequence: u64, items: Vec<Item>, mode: AddMode) {
+        self.imports.complete(sequence, mode, items);
+        while let Some((mode, items)) = self.imports.pop() {
+            self.apply_import(items, mode);
+        }
+    }
+
+    fn apply_import(&mut self, items: Vec<Item>, mode: AddMode) {
         let entries: Vec<Entry> = items.into_iter().map(Item::into_entry).collect();
         if entries.is_empty() {
             self.flash("NOTHING TO ADD");
@@ -333,9 +383,9 @@ impl Model {
         }
     }
 
-    pub fn on_meta(&mut self, id: u64, meta: Result<TrackMeta, String>) {
+    pub fn on_meta(&mut self, id: u64, location: &str, meta: Result<TrackMeta, String>) {
         let fmt = self.format.clone();
-        if let Some(e) = self.playlist.find_mut_by_id(id) {
+        if let Some(e) = self.playlist.find_mut_by_id(id).filter(|e| e.location == location) {
             match meta {
                 Ok(m) => {
                     e.length_ms = m.length_ms.or(e.length_ms);
@@ -631,16 +681,21 @@ impl Model {
     // --- skins ---------------------------------------------------------------
 
     pub fn set_skin(&mut self, path: Option<PathBuf>) {
-        match &path {
-            None => self.skin = Skin::builtin(),
+        let skin = match &path {
+            None => Skin::builtin(),
             Some(p) => match Skin::load(p) {
-                Ok(s) => self.skin = s,
+                Ok(s) => s,
                 Err(e) => {
                     self.flash(format!("SKIN ERROR: {e}"));
                     return;
                 }
             },
-        }
+        };
+        self.apply_skin(path, skin);
+    }
+
+    fn apply_skin(&mut self, path: Option<PathBuf>, skin: Skin) {
+        self.skin = skin;
         self.settings_mut().skin = path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
         self.skin_path = path;
         self.ui.push(UiReq::SkinChanged);
@@ -728,12 +783,15 @@ impl Model {
                 Request::Files { title: "Install skin".into(), multiple: false, filter: vec!["*.wsz".into(), "*.zip".into()], start }
             }
             DialogKind::Info => Request::Info { title: "File info".into(), text: self.file_info_text() },
-            DialogKind::ConfirmPhysicalRemove { paths } => Request::Question {
+            DialogKind::ConfirmOverwrite { path, .. } => {
+                Request::Question { title: "Replace existing file".into(), text: format!("Replace the existing file {}?", path.display()) }
+            }
+            DialogKind::ConfirmPhysicalRemove { entries } => Request::Question {
                 title: "Delete files".into(),
                 text: format!(
                     "Permanently delete {} file(s) from disk?\n\n{}",
-                    paths.len(),
-                    paths.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
+                    entries.len(),
+                    entries.iter().map(|(_, path)| path.as_str()).take(10).collect::<Vec<_>>().join("\n")
                 ),
             },
         };
@@ -798,13 +856,14 @@ impl Model {
             }
             DialogKind::SavePlaylist => {
                 if let Some(f) = first {
-                    let mut p = PathBuf::from(f);
+                    let selected = PathBuf::from(f);
+                    let mut p = selected.clone();
                     if plformats::PlaylistFormat::from_path(&p).is_none() {
                         p.set_extension("m3u8");
                     }
-                    if let Err(e) = self.save_playlist_file(&p) {
-                        self.flash(format!("SAVE FAILED: {e}"));
-                    }
+                    let format = plformats::PlaylistFormat::from_path(&p).unwrap_or(plformats::PlaylistFormat::M3u8);
+                    let output = plformats::write(&plformats::items_from_entries(self.playlist.entries()), format, p.parent());
+                    self.export_file(&selected, p, output.into_bytes());
                 }
             }
             DialogKind::JumpToTime => {
@@ -823,6 +882,7 @@ impl Model {
                     if let Some(e) = self.playlist.find_mut_by_id(id) {
                         e.location = loc.trim().to_string();
                         e.meta = None;
+                        e.length_ms = None;
                         e.file_title = None;
                         e.refresh_display(&fmt);
                         if wants_meta(e) {
@@ -830,6 +890,7 @@ impl Model {
                         }
                     }
                     self.pl_dirty += 1;
+                    self.update_next();
                 }
             }
             DialogKind::EqLoadPreset { auto } => {
@@ -869,14 +930,13 @@ impl Model {
             }
             DialogKind::EqExport => {
                 if let Some(f) = first {
-                    let mut p = PathBuf::from(f);
+                    let selected = PathBuf::from(f);
+                    let mut p = selected.clone();
                     if p.extension().is_none() {
                         p.set_extension("eqf");
                     }
                     let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    if let Err(e) = eqf::write_file(&p, &[self.current_preset(&name)]) {
-                        self.flash(format!("SAVE FAILED: {e}"));
-                    }
+                    self.export_file(&selected, p, eqf::serialize(&[self.current_preset(&name)]));
                 }
             }
             DialogKind::Skin => {
@@ -894,17 +954,33 @@ impl Model {
                 }
             }
             DialogKind::Info => {}
-            DialogKind::ConfirmPhysicalRemove { paths } => {
+            DialogKind::ConfirmOverwrite { path, contents } => {
                 if first.as_deref() == Some("yes") {
-                    for p in &paths {
-                        if let Err(e) = std::fs::remove_file(p) {
-                            log::warn!("cannot delete {p}: {e}");
-                        }
+                    if let Err(e) = linamp_core::config::write_atomic(&path, &contents) {
+                        self.flash(format!("SAVE FAILED: {e}"));
                     }
-                    self.playlist.remove_selected();
-                    self.pl_dirty += 1;
                 }
             }
+            DialogKind::ConfirmPhysicalRemove { entries } => {
+                if first.as_deref() == Some("yes") {
+                    let failures = remove_confirmed_files(&mut self.playlist, &entries);
+                    if failures > 0 {
+                        self.flash(format!("COULD NOT DELETE {failures} FILE(S)"));
+                    }
+                    self.pl_dirty += 1;
+                    self.update_next();
+                }
+            }
+        }
+    }
+
+    fn export_file(&mut self, selected: &Path, path: PathBuf, contents: Vec<u8>) {
+        match export_to_selected_path(selected, &path, &contents) {
+            Err(e) if selected != path && e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.request_dialog(DialogKind::ConfirmOverwrite { path, contents });
+            }
+            Err(e) => self.flash(format!("SAVE FAILED: {e}")),
+            Ok(()) => {}
         }
     }
 
@@ -912,9 +988,8 @@ impl Model {
         let dir = self.paths.skins_dir();
         let Some(name) = src.file_name() else { return };
         let dest = dir.join(name);
-        let res = std::fs::create_dir_all(&dir).and_then(|_| if src != dest { std::fs::copy(src, &dest).map(|_| ()) } else { Ok(()) });
-        match res {
-            Ok(()) => self.set_skin(Some(dest)),
+        match Skin::install_archive(src, &dest) {
+            Ok(skin) => self.apply_skin(Some(dest), skin),
             Err(e) => self.flash(format!("INSTALL FAILED: {e}")),
         }
     }
@@ -1020,6 +1095,7 @@ impl Model {
                 self.settings_mut().autoload_eq = v;
             }
             C::ClearPlaylist => {
+                self.imports.discard_pending();
                 self.playlist.clear();
                 self.pl_dirty += 1;
                 self.update_next();
@@ -1039,16 +1115,16 @@ impl Model {
                 self.pl_dirty += 1;
             }
             C::PhysicallyRemove => {
-                let paths: Vec<String> = self
+                let entries: Vec<_> = self
                     .playlist
                     .selected_indices()
                     .iter()
                     .filter_map(|&i| self.playlist.entry(i))
                     .filter(|e| !e.is_url())
-                    .map(|e| e.location.clone())
+                    .map(|e| (e.id, e.location.clone()))
                     .collect();
-                if !paths.is_empty() {
-                    self.request_dialog(DialogKind::ConfirmPhysicalRemove { paths });
+                if !entries.is_empty() {
+                    self.request_dialog(DialogKind::ConfirmPhysicalRemove { entries });
                 }
             }
             C::SelectAll => {
@@ -1498,5 +1574,100 @@ impl Model {
             esc(&cur.map(|e| e.display.clone()).unwrap_or_default()),
             esc(&cur.map(|e| e.location.clone()).unwrap_or_default()),
         )
+    }
+}
+
+/// The picker confirmed overwrites for the entered name only. A generated name
+/// must be created without replacing anything until we confirm the actual path.
+fn export_to_selected_path(selected: &Path, target: &Path, contents: &[u8]) -> std::io::Result<()> {
+    if selected == target {
+        linamp_core::config::write_atomic(target, contents)
+    } else {
+        linamp_core::config::write_atomic_new(target, contents)
+    }
+}
+
+fn remove_confirmed_files(playlist: &mut Playlist, confirmed: &[(u64, String)]) -> usize {
+    let mut deleted_paths = HashSet::new();
+    let mut failed_paths = HashSet::new();
+    let mut removed_ids = HashSet::new();
+    for (id, path) in confirmed {
+        let entry = playlist.index_of_id(*id).and_then(|i| playlist.entry(i));
+        if !entry.is_some_and(|e| e.location == *path) || failed_paths.contains(path) {
+            continue;
+        }
+        if !deleted_paths.contains(path) {
+            if let Err(err) = std::fs::remove_file(path) {
+                log::warn!("cannot delete {path}: {err}");
+                failed_paths.insert(path);
+                continue;
+            }
+            deleted_paths.insert(path);
+        }
+        removed_ids.insert(*id);
+    }
+    playlist.retain_by(|e| !removed_ids.contains(&e.id));
+    failed_paths.len()
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::*;
+
+    #[test]
+    fn completed_imports_follow_request_order_and_supersession() {
+        let mut imports = Imports::default();
+        let old = imports.begin(AddMode::ReplaceAndPlay);
+        let discarded = imports.begin(AddMode::Append);
+        imports.complete(discarded, AddMode::Append, vec![]);
+        let new = imports.begin(AddMode::ReplaceAndPlay);
+        let later = imports.begin(AddMode::Append);
+        imports.complete(later, AddMode::Append, vec![]);
+        imports.complete(old, AddMode::ReplaceAndPlay, vec![]);
+        assert!(imports.pop().is_none());
+        imports.complete(new, AddMode::ReplaceAndPlay, vec![]);
+        assert_eq!(imports.pop().unwrap().0, AddMode::ReplaceAndPlay);
+        assert_eq!(imports.pop().unwrap().0, AddMode::Append);
+        let cleared = imports.begin(AddMode::Append);
+        imports.discard_pending();
+        imports.complete(cleared, AddMode::Append, vec![]);
+        assert!(imports.pop().is_none());
+    }
+
+    #[test]
+    fn generated_export_path_preserves_existing_files() {
+        let dir = std::env::temp_dir().join(format!("linamp-export-{}", fastrand::u64(..)));
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("sample");
+        for ext in ["m3u8", "eqf"] {
+            let target = input.with_extension(ext);
+            export_to_selected_path(&input, &target, b"original").unwrap();
+            let error = export_to_selected_path(&input, &target, b"replacement").unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read(&target).unwrap(), b"original");
+            export_to_selected_path(&target, &target, b"confirmed").unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"confirmed");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn deletion_tracks_confirmed_entries_and_successful_removals() {
+        let dir = std::env::temp_dir().join(format!("linamp-delete-{}", fastrand::u64(..)));
+        std::fs::create_dir(&dir).unwrap();
+        let path = |name: &str| dir.join(name).to_str().unwrap().to_owned();
+        std::fs::write(path("delete"), b"").unwrap();
+        std::fs::write(path("keep"), b"").unwrap();
+        let mut playlist = Playlist::new();
+        playlist.extend(["delete", "delete", "missing", "keep"].map(|name| Entry::new(path(name))));
+        let confirmed: Vec<_> = playlist.entries().iter().take(3).map(|e| (e.id, e.location.clone())).collect();
+        playlist.select_only(3);
+        assert_eq!(remove_confirmed_files(&mut playlist, &confirmed), 1);
+        assert_eq!(playlist.len(), 2);
+        assert_eq!(playlist.entries()[0].location, path("missing"));
+        assert!(playlist.entries()[1].selected);
+        assert!(!dir.join("delete").exists());
+        assert!(dir.join("keep").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

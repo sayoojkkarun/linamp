@@ -67,7 +67,7 @@ pub struct AlsaPcm {
     pcm: Pcm,
     lib: &'static Lib,
     pub rate: u32,
-    pub channels: u32,
+    channels: u32,
     float: bool,
     scratch: Vec<i16>,
 }
@@ -77,6 +77,9 @@ unsafe impl Send for AlsaPcm {}
 
 impl AlsaPcm {
     pub fn open(device: &str, rate: u32, channels: u32, latency_ms: u32) -> Result<Self, String> {
+        if channels == 0 {
+            return Err("ALSA channel count must be positive".into());
+        }
         let lib = lib()?;
         let name = CString::new(device).map_err(|_| "bad device name".to_string())?;
         let mut pcm: Pcm = std::ptr::null_mut();
@@ -98,6 +101,10 @@ impl AlsaPcm {
             return Err(format!("ALSA cannot play {rate} Hz / {channels} ch: {}", err_str(lib, rc)));
         }
         Ok(Self { pcm, lib, rate, channels, float, scratch: Vec::new() })
+    }
+
+    pub fn channels(&self) -> u32 {
+        self.channels
     }
 
     /// Writes interleaved samples, blocking until the device accepted them.

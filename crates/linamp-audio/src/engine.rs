@@ -108,7 +108,7 @@ impl VisRing {
 
     fn push_stereo(&mut self, samples: &[f32], start_frame: u64) {
         self.written = start_frame;
-        for f in samples.chunks_exact(2) {
+        for f in samples.as_chunks::<2>().0 {
             self.buf[(self.written as usize) & (VIS_LEN - 1)] = (f[0] + f[1]) * 0.5;
             self.written += 1;
         }
@@ -138,6 +138,8 @@ pub struct Shared {
     sample_rate: AtomicU32,
     channels: AtomicU32,
     played_frames: AtomicU64,
+    // Updated by the controller so blocking track lookups can notice stop, open and quit.
+    playback_generation: AtomicU64,
     pub vis: Mutex<VisRing>,
 }
 
@@ -171,7 +173,7 @@ impl Shared {
 }
 
 pub struct Engine {
-    tx: Sender<EngineCmd>,
+    tx: Sender<(EngineCmd, u64)>,
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -187,6 +189,7 @@ impl Engine {
             sample_rate: AtomicU32::new(0),
             channels: AtomicU32::new(0),
             played_frames: AtomicU64::new(0),
+            playback_generation: AtomicU64::new(0),
             vis: Mutex::new(VisRing::new()),
         });
         let worker_shared = shared.clone();
@@ -198,7 +201,12 @@ impl Engine {
     }
 
     pub fn send(&self, cmd: EngineCmd) {
-        let _ = self.tx.send(cmd);
+        let generation = if matches!(cmd, EngineCmd::Open { .. } | EngineCmd::Stop | EngineCmd::Quit) {
+            self.shared.playback_generation.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.shared.playback_generation.load(Ordering::Relaxed)
+        };
+        let _ = self.tx.send((cmd, generation));
     }
 
     pub fn shared(&self) -> &Arc<Shared> {
@@ -208,7 +216,7 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        let _ = self.tx.send(EngineCmd::Quit);
+        self.send(EngineCmd::Quit);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -235,7 +243,8 @@ struct PendingSwitch {
 
 struct Worker {
     device: String,
-    rx: Receiver<EngineCmd>,
+    rx: Receiver<(EngineCmd, u64)>,
+    generation: u64,
     shared: Arc<Shared>,
     emit: Box<dyn Fn(EngineEvent) + Send>,
     pcm: Option<AlsaPcm>,
@@ -263,10 +272,11 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(device: String, rx: Receiver<EngineCmd>, shared: Arc<Shared>, emit: Box<dyn Fn(EngineEvent) + Send>) -> Self {
+    fn new(device: String, rx: Receiver<(EngineCmd, u64)>, shared: Arc<Shared>, emit: Box<dyn Fn(EngineEvent) + Send>) -> Self {
         Self {
             device,
             rx,
+            generation: 0,
             shared,
             emit,
             pcm: None,
@@ -305,7 +315,13 @@ impl Worker {
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             };
-            if let Some(cmd) = cmd {
+            if let Some((cmd, generation)) = cmd {
+                if matches!(cmd, EngineCmd::Open { .. }) {
+                    self.generation = generation;
+                    if self.cancelled() {
+                        continue;
+                    }
+                }
                 if matches!(cmd, EngineCmd::Quit) {
                     return;
                 }
@@ -421,10 +437,14 @@ impl Worker {
         }
     }
 
+    fn cancelled(&self) -> bool {
+        self.shared.playback_generation.load(Ordering::Relaxed) != self.generation
+    }
+
     fn open_decoder(&self, location: &str, start_ms: u64) -> Result<Opened, String> {
         if crate::youtube::is_youtube(location) {
             // ffmpeg seeks on its own; start where asked.
-            let (src, meta) = crate::youtube::PipeSource::open(location, start_ms)?;
+            let (src, meta) = crate::youtube::PipeSource::open_with_cancel(location, start_ms, &|| self.cancelled())?;
             Ok((Box::new(src), meta, None, None, start_ms))
         } else if is_url(location) {
             let (src, ext, headers, title) = stream::open(location, &self.proxy)?;
@@ -489,6 +509,7 @@ impl Worker {
                 self.set_state(PlayState::Playing);
                 (self.emit)(EngineEvent::Started { id, info, meta, stream: headers });
             }
+            Err(_) if self.cancelled() => {}
             Err(e) => self.fail(id, e),
         }
     }
@@ -526,35 +547,31 @@ impl Worker {
         }
     }
 
-    fn seek_to(&mut self, ms: u64) {
-        let Some(t) = &mut self.track else { return };
+    fn seek_to(&mut self, ms: u64) -> bool {
+        let Some(t) = &mut self.track else { return false };
         if !t.dec.info().seekable {
-            return;
+            return false;
         }
-        let reached = t.dec.seek(ms).unwrap_or(ms);
+        let reached = match t.dec.seek(ms) {
+            Ok(reached) => reached,
+            Err(e) => {
+                log::warn!("cannot seek: {e}");
+                return false;
+            }
+        };
         self.discard_output();
         self.track_start = self.written;
         self.seek_base_ms = reached;
         self.eq.reset();
-        // Publish now so a quick second relative seek starts from here.
         self.shared.position_ms.store(reached, Ordering::Relaxed);
+        true
     }
 
     fn seek(&mut self, ms: u64) {
-        if self.state == PlayState::Paused {
-            // Resume from the new position later.
-            if self.resume_seek.is_some() {
-                self.resume_seek = Some(ms);
-                return;
-            }
-            if let Some(p) = &mut self.pcm {
-                p.pause(false);
-            }
-            self.seek_to(ms);
-            self.resume_seek = Some(ms);
-            return;
+        if self.seek_to(ms) {
+            // A seek while paused already positioned the decoder for resume.
+            self.resume_seek = None;
         }
-        self.seek_to(ms);
     }
 
     fn stop(&mut self, notify: bool) {
@@ -606,7 +623,7 @@ impl Worker {
         let vol = volume_gain(self.volume);
         let (gl, gr) = balance_gains(self.balance);
         let mut fade_done = false;
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let mut g = vol;
             if let Some((left, total)) = &mut self.fade {
                 g *= *left as f32 / *total as f32;
@@ -655,6 +672,7 @@ impl Worker {
                     self.pending = Some(PendingSwitch { at_frame: self.written, id, info, meta });
                     return;
                 }
+                Err(_) if self.cancelled() => return,
                 Err(e) => {
                     // Let the controller decide what comes after a broken track.
                     if let Some(p) = &mut self.pcm {
@@ -695,5 +713,44 @@ mod tests {
         assert_eq!(out, [196.0, 197.0, 198.0, 199.0]);
         v.read(1002, &mut out); // before the first frame
         assert_eq!(out, [0.0, 0.0, 0.0, 1.0]);
+    }
+}
+
+#[cfg(test)]
+mod seek_tests {
+    use super::*;
+
+    struct RejectSeek(StreamInfo);
+    impl AudioSource for RejectSeek {
+        fn info(&self) -> &StreamInfo {
+            &self.0
+        }
+        fn next(&mut self, _: &mut Vec<f32>) -> Result<Status, String> {
+            Ok(Status::Eof)
+        }
+        fn seek(&mut self, _: u64) -> Result<u64, String> {
+            Err("seek unavailable".into())
+        }
+    }
+
+    #[test]
+    fn rejected_seek_preserves_clock_and_output() {
+        let engine = Engine::spawn(String::new(), |_| {});
+        let (_, rx) = crossbeam_channel::unbounded();
+        let mut worker = Worker::new(String::new(), rx, engine.shared().clone(), Box::new(|_| {}));
+        worker.track = Some(Track {
+            id: 1,
+            dec: Box::new(RejectSeek(StreamInfo { seekable: true, ..Default::default() })),
+            gain: 1.0,
+            title: None,
+            last_title: None,
+        });
+        worker.written = 1000;
+        worker.seek_base_ms = 250;
+        let before = worker.shared.position_ms();
+        assert!(!worker.seek_to(8000));
+        assert_eq!(worker.seek_base_ms, 250);
+        assert_eq!(worker.written, 1000);
+        assert_eq!(worker.shared.position_ms(), before);
     }
 }

@@ -9,7 +9,7 @@ use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::{MetadataOptions, MetadataRevision, StandardTagKey};
 use symphonia::core::probe::Hint;
-use symphonia::core::units::Time;
+use symphonia::core::units::{Time, TimeBase};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StreamInfo {
@@ -61,6 +61,12 @@ pub struct Decoder {
     frames_acc: u64,
     packets_seen: u64,
     length_known: bool,
+}
+
+fn frames_from_ticks(ticks: u64, time_base: Option<TimeBase>, rate: u32) -> u64 {
+    let Some(tb) = time_base else { return ticks };
+    let frames = u128::from(ticks) * u128::from(tb.numer) * u128::from(rate) / u128::from(tb.denom);
+    frames.min(u128::from(u64::MAX)) as u64
 }
 
 fn hint_for(ext: Option<&str>) -> Hint {
@@ -185,7 +191,7 @@ impl Decoder {
             if packet.track_id() != self.track_id {
                 continue;
             }
-            self.track_bitrate(packet.data.len() as u64, packet.dur);
+            let bytes = packet.data.len() as u64;
             let decoded = match self.codec.decode(&packet) {
                 Ok(d) => d,
                 Err(SymError::DecodeError(e)) => {
@@ -216,6 +222,7 @@ impl Decoder {
             if out.is_empty() {
                 continue;
             }
+            self.track_bitrate(bytes, frames as u64);
             return Ok(Status::Data);
         }
     }
@@ -248,8 +255,10 @@ impl Decoder {
             .seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(self.track_id) })
             .map_err(|e| format!("seek failed: {e}"))?;
         self.codec.reset();
-        self.skip_frames = seeked.required_ts.saturating_sub(seeked.actual_ts);
         let tb = self.reader.tracks().iter().find(|t| t.id == self.track_id).and_then(|t| t.codec_params.time_base);
+        self.skip_frames = frames_from_ticks(seeked.required_ts.saturating_sub(seeked.actual_ts), tb, self.info.sample_rate);
+        self.bytes_acc = 0;
+        self.frames_acc = 0;
         let reached = match tb {
             Some(tb) => {
                 let t = tb.calc_time(seeked.required_ts);
@@ -300,6 +309,13 @@ pub fn read_meta(path: &Path) -> Result<TrackMeta, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seek_uses_track_time_base() {
+        assert_eq!(frames_from_ticks(250, Some(TimeBase::new(1, 1000)), 48_000), 12_000);
+        assert_eq!(frames_from_ticks(1200, Some(TimeBase::new(1, 48_000)), 48_000), 1200);
+        assert_eq!(frames_from_ticks(1200, None, 48_000), 1200);
+    }
 
     #[test]
     fn stereo_conversion() {

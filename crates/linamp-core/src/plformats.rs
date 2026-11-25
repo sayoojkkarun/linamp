@@ -2,8 +2,10 @@
 
 use crate::playlist::{is_url, Entry};
 use crate::text::{decode_lossy, path_to_file_url, percent_decode, xml_escape, xml_unescape};
-use std::io;
+use std::collections::BTreeMap;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaylistFormat {
@@ -87,10 +89,23 @@ fn normalize(p: &Path) -> PathBuf {
 }
 
 pub fn parse(text: &str, format: PlaylistFormat, base: Option<&Path>) -> Vec<Item> {
+    parse_locations(text, format, |raw| Some(resolve(base, raw)))
+}
+
+/// A reference from an HTTP playlist must remain a network location.
+pub fn parse_remote(text: &str, format: PlaylistFormat, base: &str) -> Vec<Item> {
+    let Ok(base) = Url::parse(base) else { return Vec::new() };
+    parse_locations(text, format, |raw| {
+        let url = base.join(raw.trim()).ok()?;
+        matches!(url.scheme(), "http" | "https").then(|| url.into())
+    })
+}
+
+fn parse_locations(text: &str, format: PlaylistFormat, resolve_location: impl Fn(&str) -> Option<String>) -> Vec<Item> {
     match format {
-        PlaylistFormat::M3u | PlaylistFormat::M3u8 => parse_m3u(text, base),
-        PlaylistFormat::Pls => parse_pls(text, base),
-        PlaylistFormat::Xspf => parse_xspf(text, base),
+        PlaylistFormat::M3u | PlaylistFormat::M3u8 => parse_m3u(text, resolve_location),
+        PlaylistFormat::Pls => parse_pls(text, resolve_location),
+        PlaylistFormat::Xspf => parse_xspf(text, resolve_location),
     }
 }
 
@@ -109,13 +124,18 @@ pub fn sniff(text: &str) -> Option<PlaylistFormat> {
 }
 
 pub fn read_file(path: &Path) -> io::Result<Vec<Item>> {
-    let bytes = std::fs::read(path)?;
+    const MAX_BYTES: u64 = 16 << 20;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "playlist exceeds 16 MiB"));
+    }
     let text = decode_lossy(&bytes);
     let format = PlaylistFormat::from_path(path).or_else(|| sniff(&text)).unwrap_or(PlaylistFormat::M3u);
     Ok(parse(&text, format, path.parent()))
 }
 
-fn parse_m3u(text: &str, base: Option<&Path>) -> Vec<Item> {
+fn parse_m3u(text: &str, resolve_location: impl Fn(&str) -> Option<String>) -> Vec<Item> {
     let mut items = Vec::new();
     let mut pending: (Option<String>, Option<u64>) = (None, None);
     for line in text.lines() {
@@ -127,46 +147,66 @@ fn parse_m3u(text: &str, base: Option<&Path>) -> Vec<Item> {
             let (len, title) = info.split_once(',').unwrap_or((info, ""));
             // The duration may be followed by attributes: `#EXTINF:-1 tvg-id="x",Title`.
             let secs: i64 = len.split_whitespace().next().and_then(|s| s.parse::<f64>().ok()).map(|f| f as i64).unwrap_or(-1);
-            pending = (Some(title.trim().to_string()), (secs >= 0).then(|| secs as u64 * 1000));
+            pending = (Some(title.trim().to_string()), u64::try_from(secs).ok().and_then(|s| s.checked_mul(1000)));
             continue;
         }
         if line.starts_with('#') {
             continue;
         }
         let (title, length_ms) = std::mem::take(&mut pending);
-        items.push(Item { location: resolve(base, line), title, length_ms });
+        if let Some(location) = resolve_location(line) {
+            items.push(Item { location, title, length_ms });
+        }
     }
     items
 }
 
-fn parse_pls(text: &str, base: Option<&Path>) -> Vec<Item> {
-    let ini = crate::ini::Ini::parse(text);
-    let mut items = Vec::new();
-    let declared: usize = ini.get("playlist", "NumberOfEntries").and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    // Scan beyond the declared count, many files get it wrong.
-    let limit = declared.max(1) + 1000;
-    let mut misses = 0;
-    for i in 1..=limit {
-        match ini.get("playlist", &format!("File{i}")) {
-            Some(file) => {
-                misses = 0;
-                let title = ini.get("playlist", &format!("Title{i}")).map(str::to_string);
-                let length_ms = ini
-                    .get("playlist", &format!("Length{i}"))
-                    .and_then(|s| s.trim().parse::<i64>().ok())
-                    .filter(|&l| l >= 0)
-                    .map(|l| l as u64 * 1000);
-                items.push(Item { location: resolve(base, file), title, length_ms });
-            }
-            None => {
-                misses += 1;
-                if i > declared && misses > 50 {
-                    break;
-                }
-            }
+fn parse_pls(text: &str, resolve_location: impl Fn(&str) -> Option<String>) -> Vec<Item> {
+    // Sparse PLS files are valid. Index only actual fields and ignore the advisory entry count.
+    #[derive(Default)]
+    struct Row<'a> {
+        file: Option<&'a str>,
+        title: Option<&'a str>,
+        length_ms: Option<u64>,
+    }
+    const MAX_ROWS: usize = 65_536;
+    let mut rows = BTreeMap::<u64, Row>::new();
+    let mut in_playlist = false;
+    for line in text.lines() {
+        let line = line.trim().trim_start_matches('\u{feff}');
+        if let Some(section) = line.strip_prefix('[').and_then(|s| s.split_once(']')) {
+            in_playlist = section.0.trim().eq_ignore_ascii_case("playlist");
+            continue;
+        }
+        if !in_playlist {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let key = key.trim();
+        let Some(pos) = key.find(|c: char| c.is_ascii_digit()) else { continue };
+        let (field, number) = key.split_at(pos);
+        if !["File", "Title", "Length"].iter().any(|kind| field.eq_ignore_ascii_case(kind)) {
+            continue;
+        }
+        let Ok(index) = number.parse::<u64>() else { continue };
+        if index == 0 || (rows.len() == MAX_ROWS && !rows.contains_key(&index)) {
+            continue;
+        }
+        let row = rows.entry(index).or_default();
+        let value = value.trim();
+        if field.eq_ignore_ascii_case("file") {
+            row.file = Some(value);
+        } else if field.eq_ignore_ascii_case("title") {
+            row.title = Some(value);
+        } else {
+            row.length_ms = value.parse::<u64>().ok().and_then(|s| s.checked_mul(1000));
         }
     }
-    items
+    rows.into_values()
+        .filter_map(|row| {
+            Some(Item { location: resolve_location(row.file?)?, title: row.title.map(str::to_owned), length_ms: row.length_ms })
+        })
+        .collect()
 }
 
 fn tag_content<'a>(block: &'a str, tag: &str) -> Option<&'a str> {
@@ -182,7 +222,7 @@ fn tag_content<'a>(block: &'a str, tag: &str) -> Option<&'a str> {
     Some(body[..end].trim())
 }
 
-fn parse_xspf(text: &str, base: Option<&Path>) -> Vec<Item> {
+fn parse_xspf(text: &str, resolve_location: impl Fn(&str) -> Option<String>) -> Vec<Item> {
     let mut items = Vec::new();
     let mut rest = text;
     while let Some(start) = rest.find("<track") {
@@ -198,7 +238,9 @@ fn parse_xspf(text: &str, base: Option<&Path>) -> Vec<Item> {
                 (_, t) => t,
             };
             let length_ms = tag_content(block, "duration").and_then(|d| d.parse().ok());
-            items.push(Item { location: resolve(base, &loc), title, length_ms });
+            if let Some(location) = resolve_location(&loc) {
+                items.push(Item { location, title, length_ms });
+            }
         }
         rest = &block_start[end + "</track>".len()..];
     }
@@ -320,6 +362,32 @@ mod tests {
         let items = parse("[Playlist]\nNumberOfEntries=1\nFile1=http://a\nFile2=http://b\nTitle2=B\n", PlaylistFormat::Pls, None);
         assert_eq!(items.len(), 2);
         assert_eq!(items[1].title.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn remote_references_stay_on_the_network() {
+        let base = "https://radio.example/lists/stations.m3u";
+        let cases = [
+            (PlaylistFormat::M3u, "../stream\nfile:///local\n/root-relative\n"),
+            (PlaylistFormat::Pls, "[playlist]\nFile1=../stream\nFile2=file:///local\nFile3=/root-relative"),
+            (PlaylistFormat::Xspf, "<track><location>../stream</location></track><track><location>file:///local</location></track><track><location>/root-relative</location></track>"),
+        ];
+        for (format, text) in cases {
+            let items = parse_remote(text, format, base);
+            assert_eq!(
+                items.iter().map(|i| i.location.as_str()).collect::<Vec<_>>(),
+                ["https://radio.example/stream", "https://radio.example/root-relative"]
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_pls_rows_keep_order_and_metadata() {
+        let text = "[playlist]\nTitle3000=last\nFile3000=c.ogg\nFile9=a.ogg\nLength9=8\nNumberOfEntries=2";
+        let items = parse(text, PlaylistFormat::Pls, None);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].length_ms, Some(8000));
+        assert_eq!(items[1].title.as_deref(), Some("last"));
     }
 
     #[test]

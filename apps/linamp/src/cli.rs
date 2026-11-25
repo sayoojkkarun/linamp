@@ -42,15 +42,14 @@ pub struct Options {
 fn split_switch(arg: &str) -> Option<(String, Option<String>)> {
     let body = if let Some(b) = arg.strip_prefix("--") {
         b
-    } else if let Some(b) = arg.strip_prefix('/') {
+    } else {
+        let b = arg.strip_prefix('/')?;
         // A real absolute path is not a switch; `/INIDIR=/x/y` is.
         let name = b.split('=').next().unwrap_or(b);
         if name.contains('/') || name.is_empty() || std::path::Path::new(arg).exists() {
             return None;
         }
         b
-    } else {
-        return None;
     };
     let (name, value) = match body.split_once('=') {
         Some((n, v)) => (n, Some(v.to_string())),

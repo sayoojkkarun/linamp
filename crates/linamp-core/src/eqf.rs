@@ -41,7 +41,9 @@ pub fn db_to_value(db: f32) -> u8 {
 pub fn parse(data: &[u8]) -> io::Result<Vec<Preset>> {
     let body = data.strip_prefix(&HEADER[..]).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a Winamp EQ file"))?;
     Ok(body
-        .chunks_exact(RECORD_LEN)
+        .as_chunks::<RECORD_LEN>()
+        .0
+        .iter()
         .map(|rec| {
             let name_bytes = &rec[..NAME_LEN];
             let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(NAME_LEN);

@@ -37,8 +37,12 @@ pub enum DialogKind {
     Skin,
     InstallSkin,
     Info,
+    ConfirmOverwrite {
+        path: PathBuf,
+        contents: Vec<u8>,
+    },
     ConfirmPhysicalRemove {
-        paths: Vec<String>,
+        entries: Vec<(u64, String)>,
     },
 }
 

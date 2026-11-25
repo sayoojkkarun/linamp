@@ -16,6 +16,8 @@ libloading.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
 ureq.workspace = true
+url = "2"
+rustix = { version = "1", features = ["fs"] }
 serde_json.workspace = true
 log.workspace = true
 

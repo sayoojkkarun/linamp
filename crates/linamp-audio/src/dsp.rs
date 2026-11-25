@@ -119,7 +119,7 @@ impl Equalizer {
         if !self.settings.enabled {
             return;
         }
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             for (ch, sample) in frame.iter_mut().enumerate() {
                 let mut x = *sample * self.preamp;
                 for (c, s) in self.coeffs.iter().zip(self.state[ch].iter_mut()) {
@@ -165,7 +165,7 @@ impl Limiter {
     }
 
     pub fn process(&mut self, buf: &mut [f32]) {
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<2>().0 {
             let peak = frame[0].abs().max(frame[1].abs());
             let target = if peak * self.gain > self.threshold { self.threshold / peak } else { 1.0 };
             if target < self.gain {
