@@ -44,6 +44,7 @@ struct SkinWindow {
     /// Logical (1x) size.
     size: (i32, i32),
     visible: bool,
+    follows_main: bool,
     focused: bool,
     /// Cursor in physical window coordinates.
     cursor: (i32, i32),
@@ -94,7 +95,7 @@ pub struct App {
 impl App {
     pub fn new(model: Model, start_minimized: bool, mpris: Option<crate::mpris::Mpris>) -> App {
         let font = Font::load(&model.skin.pl.font);
-        let x11 = x11rb::connect(None).map(|(c, _)| c).map_err(|e| log::warn!("no X11 connection for window shapes: {e}")).ok();
+        let x11 = x11rb::connect(None).map(|(c, _)| c).map_err(|e| log::warn!("no X11 connection for window hints and shapes: {e}")).ok();
         App {
             model,
             font,
@@ -243,6 +244,7 @@ impl App {
                 pos,
                 size: (w, h),
                 visible: false,
+                follows_main: false,
                 focused: false,
                 cursor: (0, 0),
                 frame: Bitmap::new(w, h, 0),
@@ -252,11 +254,13 @@ impl App {
         }
         self.apply_layout();
         if self.start_minimized {
-            for k in KINDS {
-                if let Some(w) = self.win(k) {
-                    w.window.set_minimized(true);
-                }
-            }
+            self.set_minimized(true);
+        }
+    }
+
+    fn set_minimized(&self, minimized: bool) {
+        for window in self.wins.iter().flatten().filter(|w| w.visible && !w.follows_main) {
+            window.window.set_minimized(minimized);
         }
     }
 
@@ -301,11 +305,12 @@ impl App {
                 let _ = other;
             }
         }
+        let owner = self.win(WinKind::Main).and_then(|w| x11_window_id(&w.window));
         for (i, &k) in KINDS.iter().enumerate() {
             let visible = self.wanted_visible(k);
             let (lw, lh) = self.logical_size(k);
             let pos = new_pos[i];
-            if let Some(w) = self.win_mut(k) {
+            if let Some(w) = self.wins[i].as_mut() {
                 let _ = w.window.request_inner_size(PhysicalSize::new((lw * scale) as u32, (lh * scale) as u32));
                 if w.pos != pos {
                     w.window.set_outer_position(PhysicalPosition::new(pos.0, pos.1));
@@ -313,6 +318,15 @@ impl App {
                 }
                 w.size = (lw, lh);
                 if w.visible != visible {
+                    if visible && k != WinKind::Main {
+                        w.follows_main = false;
+                        if let (Some(conn), Some(main), Some(panel)) = (&self.x11, owner, x11_window_id(&w.window)) {
+                            match set_panel_hints(conn, main, panel) {
+                                Ok(()) => w.follows_main = true,
+                                Err(e) => log::warn!("cannot group Linamp panel with the main window: {e}"),
+                            }
+                        }
+                    }
                     w.window.set_visible(visible);
                     w.visible = visible;
                 }
@@ -931,19 +945,9 @@ impl App {
                     self.apply_layout();
                     self.redraw_all();
                 }
-                UiReq::Minimize => {
-                    for k in KINDS {
-                        if let Some(w) = self.win(k).filter(|w| w.visible) {
-                            w.window.set_minimized(true);
-                        }
-                    }
-                }
+                UiReq::Minimize => self.set_minimized(true),
                 UiReq::Raise => {
-                    for k in KINDS {
-                        if let Some(w) = self.win(k).filter(|w| w.visible) {
-                            w.window.set_minimized(false);
-                        }
-                    }
+                    self.set_minimized(false);
                     if let Some(w) = self.win(WinKind::Main) {
                         w.window.focus_window();
                     }
@@ -1049,6 +1053,23 @@ fn x11_window_id(w: &Window) -> Option<u32> {
         RawWindowHandle::Xcb(h) => Some(h.window.get()),
         _ => None,
     }
+}
+
+fn set_panel_hints(conn: &x11rb::rust_connection::RustConnection, main: u32, panel: u32) -> Result<(), Box<dyn std::error::Error>> {
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, PropMode};
+    use x11rb::wrapper::ConnectionExt as _;
+
+    // The window manager minimizes and restores transient panels with their owner.
+    conn.change_property32(PropMode::REPLACE, panel, AtomEnum::WM_TRANSIENT_FOR, AtomEnum::WINDOW, &[main])?.check()?;
+
+    // Set the initial taskbar hint before each map. Window managers can clear it on withdrawal.
+    let state = conn.intern_atom(false, b"_NET_WM_STATE")?.reply()?.atom;
+    let skip_taskbar = conn.intern_atom(false, b"_NET_WM_STATE_SKIP_TASKBAR")?.reply()?.atom;
+    let props = conn.get_property(false, panel, state, AtomEnum::ATOM, 0, u32::MAX)?.reply()?;
+    if !props.value32().is_some_and(|mut atoms| atoms.any(|atom| atom == skip_taskbar)) {
+        conn.change_property32(PropMode::APPEND, panel, state, AtomEnum::ATOM, &[skip_taskbar])?.check()?;
+    }
+    Ok(())
 }
 
 impl ApplicationHandler<AppEvent> for App {
